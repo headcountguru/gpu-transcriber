@@ -1,0 +1,51 @@
+[project]
+name = "gpu-transcriber"
+version = "0.1.0"
+description = "Windows desktop app that rents a Vast.ai GPU to run a speaker-diarizing transcription pipeline."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+# Runtime packages for the desktop app (installed by later tasks).
+app = [
+    "PySide6",
+    "paramiko",
+    "requests",
+    "keyring",
+    "imageio-ffmpeg",
+]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "pytest-qt",
+    "responses",
+    "black",
+    "ruff",
+    "soundfile",
+    "numpy",
+]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "remote"]
+testpaths = ["tests"]
+markers = [
+    "unit: fast, isolated unit tests",
+    "integration: tests that exercise several components together",
+    "live: tests that need real external services (Vast.ai, GPU); never run by default in CI",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+extend-exclude = "remote/"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["remote", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.coverage.run]
+source = ["common", "app"]
