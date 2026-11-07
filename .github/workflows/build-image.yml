@@ -30,6 +30,8 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4 # TODO: pin to a full commit SHA
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3 # TODO: pin to a full commit SHA
@@ -49,12 +51,17 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           image="ghcr.io/${OWNER,,}/gpu-transcriber"
+          tags="sha-${GIT_SHA}"
+          if [ "${REF_TYPE}" = "tag" ]; then
+            if ! printf '%s' "${REF_NAME}" | grep -Eq '^[A-Za-z0-9_.-]{1,128}$'; then
+              echo "::error::Git tag name is not a valid Docker tag (allowed: A-Za-z0-9_.- , 1-128 chars)"
+              exit 1
+            fi
+            tags="${tags} ${REF_NAME}"
+          fi
           {
             echo "image=${image}"
-            echo "tags<<EOF"
-            echo "${image}:sha-${GIT_SHA}"
-            if [ "${REF_TYPE}" = "tag" ]; then echo "${image}:${REF_NAME}"; fi
-            echo "EOF"
+            echo "tags=${tags}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Build image (local only)
@@ -77,7 +84,18 @@ jobs:
       - name: Image contract test
         env:
           GPU_TRANSCRIBER_TEST_IMAGE: ${{ steps.meta.outputs.image }}:ci
-        run: python -m pytest tests/test_image_contract.py -m integration -v
+        run: |
+          # pytest exits 0 when every test is skipped, so fail explicitly on any skip (the test
+          # module also fails instead of skipping when CI is set).
+          python -m pytest tests/test_image_contract.py -m integration -v -rs | tee contract.log
+          if grep -Eq '(^SKIPPED|[0-9]+ skipped)' contract.log; then
+            echo "::error::Contract tests were skipped; the image was not tested"
+            exit 1
+          fi
+          if ! grep -Eq '[0-9]+ passed' contract.log; then
+            echo "::error::No contract tests passed"
+            exit 1
+          fi
 
       - name: Capture pip freeze
         env:
@@ -90,20 +108,27 @@ jobs:
           name: pip-freeze
           path: pip-freeze.txt
 
-      # Only reached when every step above (including the contract test) succeeded.
-      - name: Push image
+      # Only reached when every step above (including the contract test) succeeded. Pushes the exact
+      # :ci image that was tested (retagged), never a rebuild.
+      - name: Push the tested image
         id: push
-        uses: docker/build-push-action@v6 # TODO: pin to a full commit SHA
-        with:
-          context: .
-          file: docker/Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          first=""
+          for tag in ${TAGS}; do
+            docker tag "${IMAGE}:ci" "${IMAGE}:${tag}"
+            docker push "${IMAGE}:${tag}"
+            if [ -z "${first}" ]; then first="${tag}"; fi
+          done
+          ref=$(docker image inspect "${IMAGE}:${first}" --format '{{index .RepoDigests 0}}')
+          echo "digest_ref=${ref}" >> "$GITHUB_OUTPUT"
 
       - name: Summarize digest and size
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
-          DIGEST: ${{ steps.push.outputs.digest }}
+          DIGEST_REF: ${{ steps.push.outputs.digest_ref }}
         run: |
           size_bytes=$(docker image inspect "${IMAGE}:ci" --format '{{.Size}}')
           {
@@ -112,7 +137,7 @@ jobs:
             echo "Digest reference (put this in app/settings.py IMAGE):"
             echo
             echo '```'
-            echo "${IMAGE}@${DIGEST}"
+            echo "${DIGEST_REF}"
             echo '```'
             echo
             echo "Uncompressed size: $((size_bytes / 1024 / 1024)) MiB"

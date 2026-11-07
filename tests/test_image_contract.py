@@ -14,13 +14,26 @@ import pytest
 
 IMAGE = os.environ.get("GPU_TRANSCRIBER_TEST_IMAGE", "")
 
+ENABLED = bool(IMAGE) and shutil.which("docker") is not None
+# CI sets CI=true. There a missing image or docker must fail, never skip: an all-skipped run exits 0
+# and would let an untested image through the build workflow's gate.
+IN_CI = bool(os.environ.get("CI"))
+
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
-        not IMAGE or shutil.which("docker") is None,
+        not ENABLED and not IN_CI,
         reason="set GPU_TRANSCRIBER_TEST_IMAGE and install docker to run the image contract",
     ),
 ]
+
+
+@pytest.fixture(autouse=True)
+def _require_image_when_in_ci():
+    # Skip marks are evaluated before fixtures, so this only runs in CI (or when enabled).
+    if not ENABLED:
+        pytest.fail("CI requires GPU_TRANSCRIBER_TEST_IMAGE to name an image and docker on PATH")
+
 
 # Runs `python -m pip <args>` inside the image and exits with pip's return code.
 _PIP = "import subprocess, sys; sys.exit(subprocess.call([sys.executable, '-m', 'pip'{args}]))"
