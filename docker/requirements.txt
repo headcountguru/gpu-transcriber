@@ -1,0 +1,21 @@
+# Python packages for the rented-GPU container image (see docker/Dockerfile).
+# torchvision must NOT appear here, directly or via a requirement: the Dockerfile removes it from
+# the base image because its compiled ops are tied to the torch build and break after pip changes
+# anything torch-adjacent. The contract test checks it is absent.
+
+# Pinned: versions already proven against the pipeline code in remote/.
+faster-whisper==1.2.1
+pyannote.audio==3.4.0
+pandas==2.2.2
+
+# TODO(pin-after-first-build): the lines below are deliberately loose. The build workflow publishes
+# the image's `pip freeze` as an artifact; replace these (and ideally the whole file) with the
+# frozen versions so every later build is identical. See docker/README.md.
+soundfile
+imageio-ffmpeg
+vastai
+
+# numpy 2 is not safe here: the torch 2.5.1 base image was built against numpy 1.x, and
+# pyannote.audio 3.4.0 (via its scientific dependencies) is only tested with numpy 1.x. pandas
+# 2.2.2 works with either. A <2 bound keeps pip from upgrading numpy underneath torch.
+numpy>=1.26,<2

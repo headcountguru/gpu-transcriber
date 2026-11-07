@@ -1,0 +1,24 @@
+# The image needs only docker/requirements.txt, docker/patch_pyannote.py, common/ and remote/.
+.git
+.github
+.venv
+.superpowers
+.claude
+tests
+docs
+scripts
+app
+*.opus
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.coverage
+htmlcov
+*.egg-info
+dist
+build
+.env
+README.md
+pyproject.toml
+docker/README.md
