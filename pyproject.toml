@@ -37,15 +37,31 @@ markers = [
 [tool.black]
 line-length = 100
 target-version = ["py310"]
-extend-exclude = "remote/"
+extend-exclude = "remote/(audio_extractor|transcriber|diarizer|aligner|forced_aligner|formatters)\\.py"
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-extend-exclude = ["remote", ".venv"]
+extend-exclude = [
+    ".venv",
+    "remote/audio_extractor.py",
+    "remote/transcriber.py",
+    "remote/diarizer.py",
+    "remote/aligner.py",
+    "remote/forced_aligner.py",
+    "remote/formatters.py",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
 
 [tool.coverage.run]
-source = ["common", "app"]
+source = ["common", "app", "remote"]
+omit = [
+    "remote/audio_extractor.py",
+    "remote/transcriber.py",
+    "remote/diarizer.py",
+    "remote/aligner.py",
+    "remote/forced_aligner.py",
+    "remote/formatters.py",
+]
