@@ -143,6 +143,9 @@ def chunk_and_diarize(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
+_TURN_KEYS = frozenset({"speaker", "start", "end"})
+
+
 def _checkpoint_path(root: Path, index: int) -> Path:
     return root / f"diar_{index:03d}.json"
 
@@ -158,6 +161,8 @@ def _load_checkpoint(
         return None
     turns = data.get("turns")
     if data.get("window") != list(window) or not isinstance(turns, list):
+        return None
+    if not all(isinstance(t, dict) and _TURN_KEYS <= t.keys() for t in turns):
         return None
     return turns
 

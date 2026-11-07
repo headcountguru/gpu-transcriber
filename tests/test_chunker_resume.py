@@ -183,3 +183,86 @@ def test_unreadable_checkpoint_is_redone(
 
     assert fake.calls == window_count(chunker)
     assert read_json(ckpt / "diar_000.json")["index"] == 0
+
+
+GOOD_TURN = {"speaker": "SPEAKER_09", "start": 0.0, "end": 1.0}
+
+
+def corrupt_checkpoint(chunker: types.ModuleType, ckpt: Path, **overrides: object) -> dict:
+    """Write diar_000.json for chunk 0 of the long audio, with some fields overridden."""
+    window = chunker.plan_windows(10.0, 0.1 * 60, 0.02 * 60)[0]
+    payload = {"index": 0, "window": list(window), "turns": [GOOD_TURN]} | overrides
+    write_json_atomic(ckpt / "diar_000.json", payload)
+    return payload
+
+
+def assert_chunk_zero_redone(
+    chunker: types.ModuleType, fake: FakeDiarizer, long_audio: str, ckpt: Path, tmp_path: Path
+) -> None:
+    fresh_dir = tmp_path / "fresh"
+    fresh_dir.mkdir()
+    fresh = chunker.chunk_and_diarize(long_audio, "tok", "cpu", checkpoint_dir=str(fresh_dir))
+    fake.calls = 0
+
+    result = chunker.chunk_and_diarize(long_audio, "tok", "cpu", checkpoint_dir=str(ckpt))
+
+    assert fake.calls == window_count(chunker)  # chunk 0 was diarized again, not loaded
+    assert result == fresh
+    assert read_json(ckpt / "diar_000.json") == read_json(fresh_dir / "diar_000.json")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"window": [0, 999.0]}, id="wrong-window-end"),
+        pytest.param({"window": [5.0, 6.0]}, id="wrong-window-start"),
+        pytest.param({"window": None}, id="window-missing"),
+        pytest.param({"index": 3}, id="wrong-index"),
+        pytest.param({"index": None}, id="index-missing"),
+        pytest.param({"turns": {"speaker": "SPEAKER_09"}}, id="turns-not-a-list"),
+        pytest.param({"turns": None}, id="turns-missing"),
+        pytest.param({"turns": [{"speaker": "SPEAKER_09", "start": 0.0}]}, id="turn-lacks-end"),
+        pytest.param({"turns": [{"start": 0.0, "end": 1.0}]}, id="turn-lacks-speaker"),
+        pytest.param({"turns": [{"speaker": "SPEAKER_09", "end": 1.0}]}, id="turn-lacks-start"),
+        pytest.param({"turns": [GOOD_TURN, "not-a-turn"]}, id="turn-not-a-dict"),
+    ],
+)
+def test_mismatched_checkpoint_is_redone(
+    chunker: types.ModuleType,
+    fake: FakeDiarizer,
+    long_audio: str,
+    tmp_path: Path,
+    overrides: dict,
+) -> None:
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    corrupt_checkpoint(chunker, ckpt, **overrides)
+
+    assert_chunk_zero_redone(chunker, fake, long_audio, ckpt, tmp_path)
+
+
+def test_checkpoint_of_a_non_object_json_is_redone(
+    chunker: types.ModuleType, fake: FakeDiarizer, long_audio: str, tmp_path: Path
+) -> None:
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    write_json_atomic(ckpt / "diar_000.json", [GOOD_TURN])
+
+    assert_chunk_zero_redone(chunker, fake, long_audio, ckpt, tmp_path)
+
+
+def test_long_audio_checkpoint_is_not_reused_for_short_audio(
+    chunker: types.ModuleType, fake: FakeDiarizer, tmp_path: Path
+) -> None:
+    short = write_silent_wav(tmp_path / "short.wav", 2.0)
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    corrupt_checkpoint(chunker, ckpt)  # window is chunk 0 of a 10 s file, not [0, 2]
+
+    result = chunker.chunk_and_diarize(short, "tok", "cpu", checkpoint_dir=str(ckpt))
+
+    assert fake.calls == 1
+    assert result == [{"speaker": "SPEAKER_00", "start": 0.0, "end": pytest.approx(2.0)}]
+    saved = read_json(ckpt / "diar_000.json")
+    assert saved["window"] == [0, pytest.approx(2.0)]
+    assert saved["turns"] == result
