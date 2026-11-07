@@ -32,6 +32,7 @@ RETRY_INTERVAL_S = 5.0
 ATTEMPT_TIMEOUT_S = 15.0  # per TCP connect / SSH banner / auth attempt
 CHANNEL_TIMEOUT_S = 60.0  # SFTP and exec channel operations
 LAUNCH_LOG_PATH = "/tmp/gpu_transcriber_runner.log"  # single-tenant rented machine
+PART_SUFFIX = ".part"
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Errors that mean "sshd not answering (yet)": refused/unreachable/timeouts, dropped handshake,
@@ -183,12 +184,26 @@ class SshRemoteSession:
         remote: str,
         on_progress: Callable[[int, int], None] | None = None,
     ) -> None:
+        """Upload to ``<remote>.part`` then rename, so the final name is never partial."""
         self._mkdir_p(posixpath.dirname(remote))
-        self._sftp.put(str(local), remote, callback=on_progress)
+        part = remote + PART_SUFFIX
+        try:
+            self._sftp.put(str(local), part, callback=on_progress)
+            self._rename_over(part, remote)
+        except BaseException:
+            self._remove_quietly(part)
+            raise
 
     def download(self, remote: str, local: Path) -> None:
+        """Download to ``<local>.part`` then replace, so the final name is never partial."""
         local.parent.mkdir(parents=True, exist_ok=True)
-        self._sftp.get(remote, str(local))
+        part = local.with_name(local.name + PART_SUFFIX)
+        try:
+            self._sftp.get(remote, str(part))
+            part.replace(local)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
 
     def list_files(self, remote_dir: str) -> list[str]:
         try:
@@ -227,6 +242,22 @@ class SshRemoteSession:
             self._sftp.close()
         finally:
             self._client.close()
+
+    def _rename_over(self, source: str, target: str) -> None:
+        """Rename ``source`` to ``target``, overwriting it (atomic where the server supports it)."""
+        try:
+            self._sftp.posix_rename(source, target)
+            return
+        except OSError:
+            logger.debug("posix_rename unavailable for %s; falling back to rename", target)
+        self._remove_quietly(target)
+        self._sftp.rename(source, target)
+
+    def _remove_quietly(self, remote_path: str) -> None:
+        try:
+            self._sftp.remove(remote_path)
+        except OSError:
+            pass
 
     def _mkdir_p(self, remote_dir: str) -> None:
         """Create ``remote_dir`` and any missing parents (SFTP has no ``mkdir -p``)."""

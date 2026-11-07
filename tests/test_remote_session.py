@@ -11,25 +11,28 @@ from typing import Any
 import paramiko
 import pytest
 
-from app.remote_session import SshRemoteSession, ensure_ssh_key
+from app.remote_session import LAUNCH_LOG_PATH, SshRemoteSession, ensure_ssh_key
 
 SECRET = "hf_SUPERSECRETTOKEN123"
 
 
 class FakeStatusEvent:
+    def __init__(self, ready: bool = True) -> None:
+        self.ready = ready
+
     def wait(self, timeout: float | None = None) -> bool:
-        return True
+        return self.ready
 
 
 class FakeChannel:
-    def __init__(self, exit_status: int = 0) -> None:
+    def __init__(self, exit_status: int = 0, ready: bool = True) -> None:
         self.exit_status = exit_status
-        self.status_event = FakeStatusEvent()
+        self.status_event = FakeStatusEvent(ready)
 
 
 class FakeStream:
-    def __init__(self, text: str = "", exit_status: int = 0) -> None:
-        self.channel = FakeChannel(exit_status)
+    def __init__(self, text: str = "", exit_status: int = 0, ready: bool = True) -> None:
+        self.channel = FakeChannel(exit_status, ready)
         self._text = text
 
     def read(self) -> bytes:
@@ -64,6 +67,8 @@ class FakeSftp:
         self.files: dict[str, bytes] = {}
         self.made: list[str] = []
         self.put_calls: list[tuple[str, str, Any]] = []
+        self.fail_transfer = False
+        self.posix_rename_supported = True
 
     def get_channel(self) -> FakeSftpChannel:
         return FakeSftpChannel()
@@ -81,11 +86,33 @@ class FakeSftp:
 
     def put(self, local: str, remote: str, callback: Any = None) -> None:
         self.put_calls.append((local, remote, callback))
+        self.files[remote] = b"partial"
         if callback is not None:
             callback(10, 10)
+        if self.fail_transfer:
+            raise OSError("connection dropped")
+        self.files[remote] = Path(local).read_bytes()
 
     def get(self, remote: str, local: str) -> None:
+        if self.fail_transfer:
+            Path(local).write_bytes(b"partial")
+            raise OSError("connection dropped")
         Path(local).write_bytes(self.files[remote])
+
+    def posix_rename(self, source: str, target: str) -> None:
+        if not self.posix_rename_supported:
+            raise OSError("posix-rename not supported")
+        self.files[target] = self.files.pop(source)
+
+    def rename(self, source: str, target: str) -> None:
+        if target in self.files:
+            raise OSError("target exists")
+        self.files[target] = self.files.pop(source)
+
+    def remove(self, path: str) -> None:
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        del self.files[path]
 
     def listdir(self, path: str) -> list[str]:
         if path not in self.dirs:
@@ -104,9 +131,12 @@ class FakeClient:
 
     instances: list["FakeClient"] = []
 
-    def __init__(self, fail_times: int = 0, exit_status: int = 0) -> None:
+    def __init__(
+        self, fail_times: int = 0, exit_status: int = 0, status_ready: bool = True
+    ) -> None:
         self.fail_times = fail_times
         self.exit_status = exit_status
+        self.status_ready = status_ready
         self.connect_calls: list[dict[str, Any]] = []
         self.commands: list[str] = []
         self.policy: object = None
@@ -127,7 +157,11 @@ class FakeClient:
 
     def exec_command(self, command: str, timeout: float | None = None) -> tuple[Any, Any, Any]:
         self.commands.append(command)
-        return None, FakeStream(exit_status=self.exit_status), FakeStream("err text")
+        return (
+            None,
+            FakeStream(exit_status=self.exit_status, ready=self.status_ready),
+            FakeStream("err text"),
+        )
 
     def close(self) -> None:
         self.closed = True
@@ -211,14 +245,30 @@ def test_connect_retries_until_ready() -> None:
 
 
 def test_connect_raises_after_timeout() -> None:
-    client = FakeClient(fail_times=10**6)
     clock = FakeClock()
+    clients: list[FakeClient] = []
+
+    def factory() -> FakeClient:
+        clients.append(FakeClient(fail_times=10**6))
+        return clients[-1]
 
     with pytest.raises(ConnectionError, match="reachable"):
-        _connect(client, clock, timeout_s=30.0)
+        SshRemoteSession.connect(
+            "1.2.3.4",
+            2222,
+            "/keys/id_ed25519",
+            timeout_s=30.0,
+            sleep=clock.sleep,
+            client_factory=factory,  # type: ignore[arg-type]
+            clock=clock,
+        )
 
-    assert clock.now >= 30.0 or len(client.connect_calls) >= 1
-    assert client.closed
+    # attempts at t=0,5,...,30; the one at t=30 hits the deadline: 7 attempts, 6 sleeps
+    assert clock.now >= 30.0
+    assert len(clock.sleeps) == 6
+    assert len(clients) == 7
+    assert all(len(c.connect_calls) == 1 for c in clients)
+    assert all(c.closed for c in clients)
 
 
 def test_connect_retries_authentication_errors() -> None:
@@ -246,7 +296,8 @@ def test_launch_exports_env_and_detaches(caplog: pytest.LogCaptureFixture) -> No
     assert len(client.commands) == 1
     command = client.commands[0]
     assert "nohup python3 /root/run_job.py --job /root/job" in command
-    assert command.rstrip().endswith("&")
+    # redirections let the exec channel close; the trailing & backgrounds the job
+    assert command.endswith(f"> {LAUNCH_LOG_PATH} 2>&1 < /dev/null &")
     assert f"export HF_TOKEN={shlex.quote(SECRET)};" in command
     assert "export A='x y'" in command
     assert SECRET not in caplog.text
@@ -260,6 +311,49 @@ def test_launch_quotes_hostile_env_values() -> None:
     session.launch("true", {"X": "a'; rm -rf /; echo '"})
 
     assert "export X='a'\"'\"'; rm -rf /; echo '\"'\"''" in client.commands[0]
+
+
+def _parse_exports(command: str) -> dict[str, str]:
+    """Parse the ``export N=v; ...`` prefix of a launch command the way a POSIX shell would."""
+    prefix = command.split("nohup ", 1)[0]
+    lexer = shlex.shlex(prefix, posix=True, punctuation_chars=";")
+    lexer.whitespace_split = True
+    tokens = list(lexer)
+    values: dict[str, str] = {}
+    for index in range(0, len(tokens), 3):
+        assert tokens[index] == "export"
+        name, _, value = tokens[index + 1].partition("=")
+        assert tokens[index + 2] == ";"
+        values[name] = value
+    return values
+
+
+def test_launch_env_values_round_trip_through_shell_quoting() -> None:
+    env = {
+        "PLAIN": "abc123",
+        "SPACES": "a b  c",
+        "QUOTES": "it's \"quoted\" 'x'",
+        "DOLLAR": "$HOME `id` $(whoami) ${X}",
+        "SEMI": "a; rm -rf / && b | c > d",
+        "EMPTY": "",
+        "UNICODE": "café ✓",
+    }
+    client = FakeClient()
+    session = _connect(client, FakeClock())
+
+    session.launch("true", env)
+
+    assert _parse_exports(client.commands[0]) == env
+
+
+def test_launch_times_out_when_remote_shell_never_returns() -> None:
+    client = FakeClient(status_ready=False)
+    session = _connect(client, FakeClock())
+
+    with pytest.raises(TimeoutError) as excinfo:
+        session.launch("true", {"HF_TOKEN": SECRET})
+
+    assert SECRET not in str(excinfo.value)
 
 
 def test_launch_rejects_bad_env_name() -> None:
@@ -288,11 +382,13 @@ def test_close_closes_sftp_and_client() -> None:
     assert client.sftp.closed and client.closed
 
 
-def test_upload_creates_parents_and_reports_progress(tmp_path: Path) -> None:
+def test_upload_creates_parents_reports_progress_and_leaves_only_final_name(
+    tmp_path: Path,
+) -> None:
     client = FakeClient()
     session = _connect(client, FakeClock())
     local = tmp_path / "a.wav"
-    local.write_bytes(b"x")
+    local.write_bytes(b"audio")
     progress: list[tuple[int, int]] = []
     client.sftp.dirs.add("/root")
 
@@ -301,18 +397,91 @@ def test_upload_creates_parents_and_reports_progress(tmp_path: Path) -> None:
     )
 
     assert client.sftp.made == ["/root/job", "/root/job/input"]
-    assert client.sftp.put_calls[0][:2] == (str(local), "/root/job/input/a.wav")
+    assert client.sftp.put_calls[0][:2] == (str(local), "/root/job/input/a.wav.part")
     assert progress == [(10, 10)]
+    assert client.sftp.files == {"/root/job/input/a.wav": b"audio"}
 
 
-def test_download_creates_local_parent(tmp_path: Path) -> None:
+def test_upload_overwrites_existing_file_with_and_without_posix_rename(tmp_path: Path) -> None:
+    local = tmp_path / "a.wav"
+    local.write_bytes(b"new")
+    for posix in (True, False):
+        client = FakeClient()
+        client.sftp.posix_rename_supported = posix
+        client.sftp.dirs.add("/r")
+        client.sftp.files["/r/a.wav"] = b"old"
+        session = _connect(client, FakeClock())
+
+        session.upload(local, "/r/a.wav")
+
+        assert client.sftp.files == {"/r/a.wav": b"new"}
+
+
+def test_upload_failure_leaves_no_final_or_part_file(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.sftp.fail_transfer = True
+    client.sftp.dirs.add("/r")
+    session = _connect(client, FakeClock())
+    local = tmp_path / "a.wav"
+    local.write_bytes(b"audio")
+
+    with pytest.raises(OSError, match="dropped"):
+        session.upload(local, "/r/a.wav")
+
+    assert client.sftp.files == {}
+    assert session.list_files("/r") == []
+
+
+def test_upload_failure_keeps_previous_final_file(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.sftp.fail_transfer = True
+    client.sftp.dirs.add("/r")
+    client.sftp.files["/r/a.wav"] = b"old"
+    session = _connect(client, FakeClock())
+    local = tmp_path / "a.wav"
+    local.write_bytes(b"audio")
+
+    with pytest.raises(OSError):
+        session.upload(local, "/r/a.wav")
+
+    assert client.sftp.files == {"/r/a.wav": b"old"}
+
+
+def test_download_creates_local_parent_and_leaves_only_final_name(tmp_path: Path) -> None:
     client = FakeClient()
     client.sftp.files["/root/out.txt"] = b"hello"
     session = _connect(client, FakeClock())
+    target = tmp_path / "sub" / "out.txt"
 
-    session.download("/root/out.txt", tmp_path / "sub" / "out.txt")
+    session.download("/root/out.txt", target)
 
-    assert (tmp_path / "sub" / "out.txt").read_bytes() == b"hello"
+    assert target.read_bytes() == b"hello"
+    assert [p.name for p in target.parent.iterdir()] == ["out.txt"]
+
+
+def test_download_overwrites_existing_local_file(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.sftp.files["/root/out.txt"] = b"new"
+    session = _connect(client, FakeClock())
+    target = tmp_path / "out.txt"
+    target.write_bytes(b"old")
+
+    session.download("/root/out.txt", target)
+
+    assert target.read_bytes() == b"new"
+
+
+def test_download_failure_leaves_no_final_or_part_file(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.sftp.fail_transfer = True
+    client.sftp.files["/root/out.txt"] = b"hello"
+    session = _connect(client, FakeClock())
+    target = tmp_path / "out.txt"
+
+    with pytest.raises(OSError, match="dropped"):
+        session.download("/root/out.txt", target)
+
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_list_files_and_read_text_handle_missing() -> None:
