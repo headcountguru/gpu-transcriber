@@ -40,6 +40,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from app.remote_session import (  # noqa: E402
     LAUNCH_LOG_PATH,
+    SSH_USER,
     RemoteSession,
     SshRemoteSession,
     ensure_ssh_key,
@@ -71,6 +72,7 @@ EXIT_OK = 0
 EXIT_JOB_PROBLEM = 1
 EXIT_REFUSED = 2
 EXIT_MACHINE_NOT_CONFIRMED_GONE = 3
+EXIT_ORPHAN_DESTROYED = 4  # an unexpected instance with our label turned up and was destroyed
 
 ENV_VAST_KEY = "VAST_API_KEY"
 ENV_HF_TOKEN = "HF_TOKEN"
@@ -92,6 +94,11 @@ CONFIRM_POLL_S = 5.0
 SELF_DESTROY_TIMEOUT_S = 300.0
 LOG_EXCERPT_CHARS = 600
 MAX_ENDPOINT_ERRORS = 3
+RESWEEP_WINDOW_S = 180.0  # how long to keep looking for a machine whose create was unclear
+RESWEEP_INTERVAL_S = 10.0
+STARTUP_BUDGET_HOURS = 0.25  # a pinned offer must be affordable for a 15-minute startup
+HTTP_NOT_FOUND = 404
+SPEND_CAP_OUTCOME = "spend-cap"
 
 RUNNER_PYTHONPATH = "/app:/app/remote"
 SELF_DESTROY_COMMAND = "vastai destroy instance $CONTAINER_ID --api-key $CONTAINER_API_KEY"
@@ -273,6 +280,9 @@ class AssumptionLog:
     def record(self, key: str, result: str, note: str = "") -> None:
         self._items[key] = Assumption(ASSUMPTION_NAMES[key], result, note)
 
+    def result(self, key: str) -> str:
+        return self._items[key].result
+
     def items(self) -> list[Assumption]:
         return list(self._items.values())
 
@@ -292,8 +302,11 @@ class EndpointTracker:
         except VastError as exc:
             self.fail(name, f"HTTP {exc.status_code}: {exc}" if exc.status_code else str(exc))
             raise
-        self._ok[name] = self._ok.get(name, 0) + 1
+        self.ok(name)
         return value
+
+    def ok(self, name: str) -> None:
+        self._ok[name] = self._ok.get(name, 0) + 1
 
     def fail(self, name: str, message: str) -> None:
         errors = self._errors.setdefault(name, [])
@@ -311,6 +324,25 @@ class EndpointTracker:
         return "PASS", f"all returned the expected shape ({counts})"
 
 
+class SpendCapReached(RuntimeError):
+    """The rental has cost ``--max-spend``. The run stops and the machine is destroyed."""
+
+
+@dataclass(frozen=True)
+class SpendGuard:
+    """Raises ``SpendCapReached`` once the rental (since ``created_at``) has cost ``max_spend``."""
+
+    clock: Callable[[], float]
+    created_at: float
+    price_per_hour: float
+    max_spend: float
+
+    def check(self) -> None:
+        hours = (self.clock() - self.created_at) / SECONDS_PER_HOUR
+        if spend_cap_reached(hours, self.price_per_hour, self.max_spend):
+            raise SpendCapReached(f"the spend cap of ${self.max_spend:.2f} was reached")
+
+
 @dataclass
 class SmokeRun:
     """Mutable state of one live run, shared by the steps and the cleanup."""
@@ -318,6 +350,8 @@ class SmokeRun:
     client: VastClient
     settings: Settings
     secrets: list[str]
+    clock: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
     log: AssumptionLog = field(default_factory=AssumptionLog)
     tracker: EndpointTracker = field(default_factory=EndpointTracker)
     timings: dict[str, float] = field(default_factory=dict)
@@ -327,11 +361,18 @@ class SmokeRun:
     created_at: float | None = None
     ended_at: float | None = None
     create_attempted: bool = False
+    guard: SpendGuard | None = None
+    self_destroy_attempted: bool = False
+    orphan_found: bool = False
 
     def billed_hours(self) -> float:
         if self.created_at is None:
             return 0.0
-        return (time.monotonic() - self.created_at) / SECONDS_PER_HOUR
+        return (self.clock() - self.created_at) / SECONDS_PER_HOUR
+
+    def check_spend(self) -> None:
+        if self.guard is not None:
+            self.guard.check()
 
 
 @dataclass(frozen=True)
@@ -397,7 +438,7 @@ def poll_job(
             if status.state == "failed":
                 return PollResult("failed", first_seen, elapsed, status)
         if spend_cap_reached(billed_hours(), price_per_hour, max_spend):
-            return PollResult("spend-cap", first_seen, elapsed, last)
+            return PollResult(SPEND_CAP_OUTCOME, first_seen, elapsed, last)
         if elapsed >= timeout_s:
             return PollResult("timeout", first_seen, elapsed, last)
         sleep(poll_interval_s)
@@ -437,19 +478,36 @@ def choose_offer(run: SmokeRun, offer_id: int | None, max_spend: float) -> Offer
         offer = next((o for o in unfiltered if o.id == offer_id), None)
         if offer is None:
             raise SmokeRefusal(f"Offer {offer_id} is not in the current rentable list")
+        _require_affordable(offer, run.settings, max_spend)
         return offer
     ranked = rank_offers(filtered, run.settings)
     if not ranked:
         raise SmokeRefusal("No machine fits the settings right now; try again later")
+    _require_affordable(ranked[0], run.settings, max_spend)
     return ranked[0]
+
+
+def _require_affordable(offer: Offer, settings: Settings, max_spend: float) -> None:
+    """Refuse an offer over the price ceiling or one that cannot pay for a 15-minute startup."""
+    if offer.dph_total > settings.max_price_per_hour:
+        raise SmokeRefusal(
+            f"Offer {offer.id} costs ${offer.dph_total:.2f}/h, over the "
+            f"${settings.max_price_per_hour:.2f}/h ceiling"
+        )
+    startup_cost = offer.dph_total * STARTUP_BUDGET_HOURS
+    if startup_cost > max_spend:
+        raise SmokeRefusal(
+            f"Offer {offer.id} would spend about ${startup_cost:.2f} on a 15-minute startup "
+            f"alone, over --max-spend ${max_spend:.2f}"
+        )
 
 
 def prepare(run: SmokeRun, args: argparse.Namespace, workdir: Path) -> Prepared:
     """Compress the audio, set up the SSH key, and pick the machine. Rents nothing."""
-    started = time.monotonic()
+    started = run.clock()
     opus_path = workdir / REMOTE_AUDIO_NAME
     audio_seconds = compress_audio(args.audio, opus_path)
-    run.timings["compress"] = time.monotonic() - started
+    run.timings["compress"] = run.clock() - started
     key_path, public_key = ensure_ssh_key(app_data_dir())
     offer = choose_offer(run, args.offer_id, args.max_spend)
     run.tracker.call("register_ssh_key", lambda: run.client.register_ssh_key(public_key))
@@ -469,11 +527,12 @@ def onstart_script(job_dir: str) -> str:
     )
 
 
-def rent_machine(run: SmokeRun, offer: Offer) -> int:
+def rent_machine(run: SmokeRun, offer: Offer, max_spend: float) -> int:
     """Rent the offer and check the new instance shows up in the label listing."""
     run.label = f"{run.settings.label_prefix}smoke-{time.strftime('%Y%m%d%H%M%S')}"
     run.create_attempted = True
-    run.created_at = time.monotonic()
+    run.created_at = run.clock()
+    run.guard = SpendGuard(run.clock, run.created_at, offer.dph_total, max_spend)
     instance_id = run.tracker.call(
         "create",
         lambda: run.client.create_instance(
@@ -495,15 +554,16 @@ def rent_machine(run: SmokeRun, offer: Offer) -> int:
 
 def wait_for_endpoint(run: SmokeRun, instance_id: int) -> Instance:
     """Wait until the instance is running and reports an SSH host and port."""
-    deadline = time.monotonic() + STARTUP_TIMEOUT_S
-    while time.monotonic() < deadline:
+    deadline = run.clock() + STARTUP_TIMEOUT_S
+    while run.clock() < deadline:
+        run.check_spend()
         try:
             instance = run.tracker.call(
                 "get_instance", lambda: run.client.get_instance(instance_id)
             )
         except VastError as exc:
             logger.warning("Could not check the instance yet: %s", exc)
-            time.sleep(POLL_INTERVAL_S)
+            run.sleep(POLL_INTERVAL_S)
             continue
         if instance is None:
             raise RuntimeError("Vast.ai no longer lists the instance")
@@ -512,20 +572,32 @@ def wait_for_endpoint(run: SmokeRun, instance_id: int) -> Instance:
         if instance.status == "running" and instance.ssh_host and instance.ssh_port:
             return instance
         logger.info("Instance status: %s", instance.status)
-        time.sleep(POLL_INTERVAL_S)
+        run.sleep(POLL_INTERVAL_S)
     raise TimeoutError(f"The instance was not running after {STARTUP_TIMEOUT_S:.0f}s")
 
 
 def connect_ssh(run: SmokeRun, instance: Instance, key_path: Path) -> SshRemoteSession:
     assert instance.ssh_host is not None and instance.ssh_port is not None
+
+    def guarded_sleep(seconds: float) -> None:
+        run.check_spend()  # raises out of the connect retry loop once the cap is reached
+        run.sleep(seconds)
+
+    run.check_spend()
     try:
         session = SshRemoteSession.connect(
-            instance.ssh_host, instance.ssh_port, str(key_path), timeout_s=SSH_TIMEOUT_S
+            instance.ssh_host,
+            instance.ssh_port,
+            str(key_path),
+            timeout_s=SSH_TIMEOUT_S,
+            sleep=guarded_sleep,
+            clock=run.clock,
         )
     except ConnectionError as exc:
         run.log.record(A_SSH, "FAIL", str(exc))
         raise
-    run.log.record(A_SSH, "PASS", f"connected as root to {instance.ssh_host}:{instance.ssh_port}")
+    where = f"{instance.ssh_host}:{instance.ssh_port}"
+    run.log.record(A_SSH, "PASS", f"connected as {SSH_USER} to {where}")
     return session
 
 
@@ -549,12 +621,18 @@ def probe_posix_rename(run: SmokeRun, session: SshRemoteSession, workdir: Path) 
 
 def upload_inputs(run: SmokeRun, session: SshRemoteSession, prepared: Prepared, tmp: Path) -> None:
     job_dir = run.settings.remote_job_dir
-    started = time.monotonic()
-    session.upload(prepared.opus_path, f"{job_dir}/{JOB_INPUT_DIR}/{REMOTE_AUDIO_NAME}")
-    run.timings["upload"] = time.monotonic() - started
+
+    def guard_progress(_sent: int, _total: int) -> None:
+        run.check_spend()
+
+    run.check_spend()
+    started = run.clock()
+    remote_audio = f"{job_dir}/{JOB_INPUT_DIR}/{REMOTE_AUDIO_NAME}"
+    session.upload(prepared.opus_path, remote_audio, guard_progress)
+    run.timings["upload"] = run.clock() - started
     job_file = tmp / JOB_FILE
     write_json_atomic(job_file, {"max_runtime_s": max_runtime_s(prepared.audio_seconds)})
-    session.upload(job_file, f"{job_dir}/{JOB_FILE}")
+    session.upload(job_file, f"{job_dir}/{JOB_FILE}", guard_progress)
 
 
 def record_runner_outcome(run: SmokeRun, session: SshRemoteSession, result: PollResult) -> None:
@@ -574,7 +652,7 @@ def record_runner_outcome(run: SmokeRun, session: SshRemoteSession, result: Poll
 
 def download_outputs(run: SmokeRun, session: SshRemoteSession, out_dir: Path) -> bool:
     """Download the three output files; True only if all arrived."""
-    started = time.monotonic()
+    started = run.clock()
     complete = True
     for name in OUTPUT_FILES:
         remote = f"{run.settings.remote_job_dir}/{JOB_OUTPUT_DIR}/{name}"
@@ -584,33 +662,35 @@ def download_outputs(run: SmokeRun, session: SshRemoteSession, out_dir: Path) ->
             logger.error("Could not download %s: %s", name, exc)
             run.notes.append(f"Output file {name} was not downloaded ({type(exc).__name__})")
             complete = False
-    run.timings["download"] = time.monotonic() - started
+    run.timings["download"] = run.clock() - started
     return complete
 
 
 def verify_self_destroy(run: SmokeRun, session: SshRemoteSession, instance_id: int) -> None:
     """Have the machine destroy itself, then watch Vast.ai until it is gone (assumption g)."""
+    run.self_destroy_attempted = True
     try:
         session.launch(SELF_DESTROY_COMMAND, {})
     except (RuntimeError, TimeoutError, *_LINK_ERRORS) as exc:
         run.log.record(A_SELF_DESTROY, "FAIL", f"could not launch the command: {exc}")
         return
-    started = time.monotonic()
-    while time.monotonic() - started < SELF_DESTROY_TIMEOUT_S:
+    started = run.clock()
+    while run.clock() - started < SELF_DESTROY_TIMEOUT_S:
+        run.check_spend()
         try:
             instance = run.client.get_instance(instance_id)
         except VastError as exc:
             logger.warning("Could not check the instance: %s", exc)
-            time.sleep(POLL_INTERVAL_S)
+            run.sleep(POLL_INTERVAL_S)
             continue
         if instance is None:
-            elapsed = time.monotonic() - started
-            run.ended_at = time.monotonic()
+            elapsed = run.clock() - started
+            run.ended_at = run.clock()
             run.log.record(
                 A_SELF_DESTROY, "PASS", f"instance gone {elapsed:.0f}s after the command"
             )
             return
-        time.sleep(POLL_INTERVAL_S)
+        run.sleep(POLL_INTERVAL_S)
     run.log.record(
         A_SELF_DESTROY, "FAIL", f"instance still listed {SELF_DESTROY_TIMEOUT_S:.0f}s later"
     )
@@ -626,11 +706,13 @@ def run_remote_job(
 ) -> str:
     """Upload, run the pipeline, poll, and download. Returns the outcome word."""
     job_dir = run.settings.remote_job_dir
+    run.check_spend()
     probe_posix_rename(run, session, tmp)
     upload_inputs(run, session, prepared, tmp)
     command = (
         f"env PYTHONPATH={RUNNER_PYTHONPATH} python /app/remote/run_job.py --job-dir {job_dir}"
     )
+    run.check_spend()
     session.launch(command, {ENV_HF_TOKEN: hf_token})
     result = poll_job(
         session,
@@ -639,6 +721,8 @@ def run_remote_job(
         price_per_hour=prepared.offer.dph_total,
         max_spend=args.max_spend,
         timeout_s=max_runtime_s(prepared.audio_seconds),
+        clock=run.clock,
+        sleep=run.sleep,
     )
     record_runner_outcome(run, session, result)
     if result.first_seen:
@@ -662,10 +746,10 @@ def execute(
     run: SmokeRun, args: argparse.Namespace, hf_token: str, prepared: Prepared, tmp: Path
 ) -> str:
     """Rent, wait, run the job. Cleanup is the caller's ``finally``."""
-    instance_id = rent_machine(run, prepared.offer)
+    instance_id = rent_machine(run, prepared.offer, args.max_spend)
     instance = wait_for_endpoint(run, instance_id)
     session = connect_ssh(run, instance, prepared.key_path)
-    run.timings["startup"] = time.monotonic() - (run.created_at or time.monotonic())
+    run.timings["startup"] = run.clock() - (run.created_at or run.clock())
     try:
         return run_remote_job(run, args, hf_token, prepared, session, tmp)
     finally:
@@ -679,21 +763,42 @@ def execute(
 
 
 def destroy_and_confirm(run: SmokeRun, instance_id: int) -> bool:
-    """Destroy (three tries) and confirm the instance is gone. False if it may still bill."""
-    try:
-        if run.client.get_instance(instance_id) is None:
-            logger.info("Instance %s is already gone", instance_id)
-            return True
-    except VastError as exc:
-        logger.warning("Could not check instance %s before destroying: %s", instance_id, exc)
+    """Always call destroy (three tries), then confirm the instance is gone.
+
+    Never skipped because ``get_instance`` says "not found": Vast.ai can be briefly inconsistent
+    right after a create. A 404 from destroy itself means the machine is already gone.
+    False means the instance may still be billing.
+    """
     for attempt in range(1, DESTROY_ATTEMPTS + 1):
         try:
-            run.tracker.call("destroy", lambda: run.client.destroy_instance(instance_id))
-            break
+            run.client.destroy_instance(instance_id)
         except VastError as exc:
+            if exc.status_code == HTTP_NOT_FOUND:
+                _note_destroy_404(run, instance_id)
+                break
+            run.tracker.fail("destroy", f"HTTP {exc.status_code}: {exc}")
             logger.warning("Destroy attempt %d for %s failed: %s", attempt, instance_id, exc)
-            time.sleep(DESTROY_RETRY_S)
-    deadline = time.monotonic() + CONFIRM_GONE_TIMEOUT_S
+            run.sleep(DESTROY_RETRY_S)
+        else:
+            run.tracker.ok("destroy")
+            logger.info("Destroyed instance %s", instance_id)
+            break
+    return _confirm_gone(run, instance_id)
+
+
+def _note_destroy_404(run: SmokeRun, instance_id: int) -> None:
+    logger.info("Destroy of instance %s returned 404: it is already gone", instance_id)
+    run.notes.append(f"API destroy of instance {instance_id} returned 404 (already gone).")
+    if run.self_destroy_attempted and run.log.result(A_SELF_DESTROY) != "PASS":
+        run.log.record(
+            A_SELF_DESTROY,
+            "PASS",
+            "the safety-net API destroy got 404: the machine destroyed itself",
+        )
+
+
+def _confirm_gone(run: SmokeRun, instance_id: int) -> bool:
+    deadline = run.clock() + CONFIRM_GONE_TIMEOUT_S
     while True:
         try:
             if run.client.get_instance(instance_id) is None:
@@ -701,31 +806,74 @@ def destroy_and_confirm(run: SmokeRun, instance_id: int) -> bool:
                 return True
         except VastError as exc:
             logger.warning("Could not confirm instance %s is gone: %s", instance_id, exc)
-        if time.monotonic() >= deadline:
+        if run.clock() >= deadline:
             return False
-        time.sleep(CONFIRM_POLL_S)
+        run.sleep(CONFIRM_POLL_S)
+
+
+def list_label(run: SmokeRun) -> set[int] | None:
+    """Ids of instances carrying this run's label, or None if the listing failed."""
+    try:
+        listed = run.tracker.call("list", lambda: run.client.list_instances(run.label))
+    except VastError as exc:
+        logger.error("Could not list instances labelled %s: %s", run.label, exc)
+        return None
+    return {item.id for item in listed}
+
+
+def find_unknown_instances(run: SmokeRun) -> set[int] | None:
+    """After a create whose outcome is unknown, look for the machine for ``RESWEEP_WINDOW_S``.
+
+    Returns the ids found (empty if nothing appeared), or None if the label could never be
+    listed. A freshly created instance may not be listed immediately, so one look is not enough.
+    """
+    deadline = run.clock() + RESWEEP_WINDOW_S
+    listed_once = False
+    while True:
+        found = list_label(run)
+        if found:
+            return found
+        listed_once = listed_once or found is not None
+        if run.clock() >= deadline:
+            break
+        run.sleep(RESWEEP_INTERVAL_S)
+    if not listed_once:
+        return None
+    logger.warning(
+        "No instance labelled %s appeared in %.0f s after the unclear create. "
+        "Check the Vast.ai console for label %s.",
+        run.label,
+        RESWEEP_WINDOW_S,
+        run.label,
+    )
+    return set()
 
 
 def cleanup(run: SmokeRun) -> bool:
     """Destroy the known instance and anything carrying this run's label. True if all gone."""
     ids: set[int] = set()
-    sweep_ok = True
+    all_gone = True
     if run.instance_id is not None:
         ids.add(run.instance_id)
-    if run.label:
-        try:
-            ids.update(
-                i.id for i in run.tracker.call("list", lambda: run.client.list_instances(run.label))
+    if run.label and run.create_attempted and run.instance_id is None:
+        found = find_unknown_instances(run)
+        if found is None:
+            all_gone = False
+            logger.critical(
+                "A machine may have been rented and could not be looked for. "
+                "CHECK VAST.AI for label %s.",
+                run.label,
             )
-        except VastError as exc:
-            sweep_ok = False
-            logger.error("Could not sweep for instances labelled %s: %s", run.label, exc)
-    all_gone = sweep_ok or run.instance_id is not None
-    if not sweep_ok and run.instance_id is None and run.create_attempted:
-        logger.critical(
-            "A machine may have been rented and could not be looked for. CHECK VAST.AI."
-        )
-        all_gone = False
+        elif found:
+            run.orphan_found = True
+            ids |= found
+            logger.critical(
+                "AN INSTANCE WITH LABEL %s APPEARED AFTER AN UNCLEAR CREATE: %s. Destroying it.",
+                run.label,
+                sorted(found),
+            )
+    elif run.label:
+        ids |= list_label(run) or set()
     for instance_id in sorted(ids):
         if not destroy_and_confirm(run, instance_id):
             all_gone = False
@@ -735,7 +883,7 @@ def cleanup(run: SmokeRun) -> bool:
                 instance_id,
             )
     if run.ended_at is None:
-        run.ended_at = time.monotonic()
+        run.ended_at = run.clock()
     return all_gone
 
 
@@ -758,6 +906,8 @@ def write_report(run: SmokeRun, args: argparse.Namespace, prepared: Prepared, ou
     else:
         hours = 0.0
     cost = hours * prepared.offer.dph_total
+    if outcome == SPEND_CAP_OUTCOME:
+        outcome = f"{outcome} (stopped at spend cap of ${args.max_spend:.2f}; job not finished)"
     run.notes.insert(0, f"Outcome: {outcome}")
     run.notes.append(
         "Stage times come from polling every "
@@ -785,9 +935,18 @@ def write_report(run: SmokeRun, args: argparse.Namespace, prepared: Prepared, ou
     return args.report_path
 
 
-def run_smoke(args: argparse.Namespace, vast_key: str, hf_token: str) -> int:
+def run_smoke(
+    args: argparse.Namespace,
+    vast_key: str,
+    hf_token: str,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
     """One real job. Always destroys the machine. Returns the process exit code."""
-    run = SmokeRun(VastClient(vast_key), Settings(image=IMAGE), [vast_key, hf_token])
+    run = SmokeRun(
+        VastClient(vast_key), Settings(image=IMAGE), [vast_key, hf_token], clock=clock, sleep=sleep
+    )
     with tempfile.TemporaryDirectory(prefix="gputx-smoke-") as tmp_name:
         tmp = Path(tmp_name)
         try:
@@ -798,6 +957,9 @@ def run_smoke(args: argparse.Namespace, vast_key: str, hf_token: str) -> int:
         outcome = "error"
         try:
             outcome = execute(run, args, hf_token, prepared, tmp)
+        except SpendCapReached as exc:
+            logger.error("Stopping: %s", exc)
+            outcome = SPEND_CAP_OUTCOME
         except Exception as exc:
             logger.exception("The run failed")
             outcome = f"error: {type(exc).__name__}"
@@ -809,6 +971,8 @@ def run_smoke(args: argparse.Namespace, vast_key: str, hf_token: str) -> int:
                 logger.exception("Could not write the report")
     if not all_gone:
         return EXIT_MACHINE_NOT_CONFIRMED_GONE
+    if run.orphan_found:
+        return EXIT_ORPHAN_DESTROYED
     return EXIT_OK if outcome == "done" else EXIT_JOB_PROBLEM
 
 
