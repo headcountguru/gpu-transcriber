@@ -1,9 +1,13 @@
 import logging
 import os
 import tempfile
+from collections.abc import Callable
+from pathlib import Path
 
 import soundfile as sf
 from diarizer import diarize_audio
+
+from common.jsonio import read_json, write_json_atomic
 
 # Files longer than this get chunked before diarization
 CHUNK_THRESHOLD_MINUTES = 60
@@ -11,8 +15,28 @@ CHUNK_MINUTES = 30
 OVERLAP_MINUTES = 2
 
 
+def plan_windows(
+    total_secs: float, chunk_secs: float, overlap_secs: float
+) -> list[tuple[float, float]]:
+    """Split [0, total_secs] into chunk_secs windows that overlap by overlap_secs."""
+    windows = []
+    start = 0.0
+    while start < total_secs:
+        end = min(start + chunk_secs, total_secs)
+        windows.append((start, end))
+        if end >= total_secs:
+            break
+        start = end - overlap_secs
+    return windows
+
+
 def chunk_and_diarize(
-    audio_path: str, hf_token: str, device: str, progress_callback=None
+    audio_path: str,
+    hf_token: str,
+    device: str,
+    progress_callback: Callable[[str, int, str], None] | None = None,
+    checkpoint_dir: str | None = None,
+    on_chunk: Callable[[int, int], None] | None = None,
 ) -> list[dict]:
     """
     Diarizes audio, chunking into overlapping segments for long files.
@@ -23,28 +47,37 @@ def chunk_and_diarize(
     coverage in the overlap region, then turns are merged into a single
     timeline.
 
+    When checkpoint_dir is given, each finished chunk is saved as
+    diar_{index:03d}.json (absolute times) and chunks whose checkpoint already
+    exists are loaded instead of re-diarized, so an interrupted job can resume.
+    on_chunk(completed, total) fires after every chunk, including loaded ones.
+
     Returns: [{'speaker': str, 'start': float, 'end': float}, ...]
     """
     with sf.SoundFile(audio_path) as f:
         sr = f.samplerate
         total_secs = len(f) / sr
 
+    ckpt_root = Path(checkpoint_dir) if checkpoint_dir else None
+    if ckpt_root:
+        ckpt_root.mkdir(parents=True, exist_ok=True)
+
     threshold = CHUNK_THRESHOLD_MINUTES * 60
     if total_secs <= threshold:
-        return diarize_audio(audio_path, hf_token=hf_token, device=device)
+        window = (0.0, total_secs)
+        turns = _load_checkpoint(ckpt_root, 0, window)
+        if turns is None:
+            turns = diarize_audio(audio_path, hf_token=hf_token, device=device)
+            _save_checkpoint(ckpt_root, 0, window, turns)
+        if on_chunk:
+            on_chunk(1, 1)
+        return turns
 
     chunk_secs = CHUNK_MINUTES * 60
     overlap_secs = OVERLAP_MINUTES * 60
 
     # ── Build chunk windows ───────────────────────────────────────────────────
-    windows = []
-    start = 0.0
-    while start < total_secs:
-        end = min(start + chunk_secs, total_secs)
-        windows.append((start, end))
-        if end >= total_secs:
-            break
-        start = end - overlap_secs
+    windows = plan_windows(total_secs, chunk_secs, overlap_secs)
 
     n = len(windows)
     logging.info(
@@ -58,6 +91,17 @@ def chunk_and_diarize(
 
     try:
         for i, (win_start, win_end) in enumerate(windows):
+            abs_turns = _load_checkpoint(ckpt_root, i, (win_start, win_end))
+            if abs_turns is not None:
+                if progress_callback:
+                    progress_callback(
+                        "diarization", 65, f"Chunk {i+1}/{n} already diarized (resumed)"
+                    )
+                chunk_turns.append((win_start, win_end, abs_turns))
+                if on_chunk:
+                    on_chunk(i + 1, n)
+                continue
+
             if progress_callback:
                 progress_callback(
                     "diarization",
@@ -82,7 +126,10 @@ def chunk_and_diarize(
                 }
                 for t in rel_turns
             ]
+            _save_checkpoint(ckpt_root, i, (win_start, win_end), abs_turns)
             chunk_turns.append((win_start, win_end, abs_turns))
+            if on_chunk:
+                on_chunk(i + 1, n)
 
     finally:
         for tmp in tmp_files:
@@ -94,6 +141,36 @@ def chunk_and_diarize(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _checkpoint_path(root: Path, index: int) -> Path:
+    return root / f"diar_{index:03d}.json"
+
+
+def _load_checkpoint(
+    root: Path | None, index: int, window: tuple[float, float]
+) -> list[dict] | None:
+    """Return a chunk's saved turns, or None if absent, unreadable or for another window."""
+    if root is None:
+        return None
+    data = read_json(_checkpoint_path(root, index))
+    if not isinstance(data, dict) or data.get("index") != index:
+        return None
+    turns = data.get("turns")
+    if data.get("window") != list(window) or not isinstance(turns, list):
+        return None
+    return turns
+
+
+def _save_checkpoint(
+    root: Path | None, index: int, window: tuple[float, float], turns: list[dict]
+) -> None:
+    if root is None:
+        return
+    write_json_atomic(
+        _checkpoint_path(root, index),
+        {"index": index, "window": list(window), "turns": turns},
+    )
 
 
 def _extract_chunk(audio_path: str, start_sec: float, end_sec: float, sr: int) -> str:
