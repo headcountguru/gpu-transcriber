@@ -8,7 +8,14 @@ import requests
 import responses
 
 from app.settings import IMAGE, Settings, app_data_dir
-from app.vast_client import Instance, Offer, VastClient, VastError, rank_offers
+from app.vast_client import (
+    Instance,
+    Offer,
+    VastAmbiguousCreateError,
+    VastClient,
+    VastError,
+    rank_offers,
+)
 
 BASE = "https://console.vast.ai/api/v0"
 V1 = "https://console.vast.ai/api/v1"
@@ -443,3 +450,115 @@ def test_custom_session_and_base_url_are_used():
     assert custom.get_balance() == 3.0
     assert custom.list_instances("gputx-") == []
     assert "Authorization" not in session.headers  # key is never stored on a shared session
+
+
+# --- server-side search filters ---------------------------------------------------------------
+
+
+@responses.activate
+def test_search_offers_with_settings_sends_server_side_filters(client, settings):
+    responses.post(f"{BASE}/bundles/", json={"offers": []})
+
+    client.search_offers(settings)
+
+    body = json.loads(responses.calls[0].request.body)
+    assert body["gpu_ram"] == {"gte": 16000.0}  # MB, matches the /1000 conversion
+    assert body["dph_total"] == {"lte": 1.0}
+    assert body["reliability"] == {"gte": 0.97}
+    assert body["inet_down"] == {"gte": 200.0}
+    assert body["cuda_max_good"] == {"gte": 12.4}
+    assert body["num_gpus"] == {"eq": 1}  # base filters are kept
+
+
+@responses.activate
+def test_search_offers_filters_follow_the_given_settings(client, settings):
+    responses.post(f"{BASE}/bundles/", json={"offers": []})
+
+    client.search_offers(replace(settings, min_vram_gb=24.0, max_price_per_hour=0.5))
+
+    body = json.loads(responses.calls[0].request.body)
+    assert body["gpu_ram"] == {"gte": 24000.0}
+    assert body["dph_total"] == {"lte": 0.5}
+
+
+@responses.activate
+def test_search_offers_without_settings_sends_no_minimums(client):
+    responses.post(f"{BASE}/bundles/", json={"offers": []})
+
+    client.search_offers()
+
+    body = json.loads(responses.calls[0].request.body)
+    for key in ("gpu_ram", "dph_total", "reliability", "inet_down", "cuda_max_good"):
+        assert key not in body
+
+
+# --- ambiguous create -------------------------------------------------------------------------
+
+
+@responses.activate
+def test_create_instance_read_timeout_is_flagged_as_maybe_created(client):
+    responses.put(f"{BASE}/asks/777/", body=requests.ReadTimeout(f"slow {API_KEY}"))
+
+    with pytest.raises(VastAmbiguousCreateError) as err:
+        client.create_instance(777, "img", "gputx-x", 40, "true", {})
+
+    assert err.value.maybe_created is True
+    assert isinstance(err.value, VastError)
+    assert str(err.value) == "Vast.ai did not answer in time; a machine may have been rented"
+    assert API_KEY not in str(err.value)
+
+
+@responses.activate
+def test_create_instance_connect_timeout_is_a_plain_vasterror(client):
+    responses.put(f"{BASE}/asks/777/", body=requests.ConnectTimeout(f"slow {API_KEY}"))
+
+    with pytest.raises(VastError) as err:
+        client.create_instance(777, "img", "gputx-x", 40, "true", {})
+
+    assert not isinstance(err.value, VastAmbiguousCreateError)
+    assert getattr(err.value, "maybe_created", False) is False
+    assert API_KEY not in str(err.value)
+
+
+@responses.activate
+def test_create_instance_connection_error_is_a_plain_vasterror(client):
+    responses.put(f"{BASE}/asks/777/", body=requests.ConnectionError("refused"))
+
+    with pytest.raises(VastError) as err:
+        client.create_instance(777, "img", "gputx-x", 40, "true", {})
+
+    assert not isinstance(err.value, VastAmbiguousCreateError)
+
+
+@responses.activate
+def test_read_timeout_on_other_calls_is_a_plain_vasterror(client):
+    responses.get(f"{BASE}/users/current/", body=requests.ReadTimeout("slow"))
+
+    with pytest.raises(VastError) as err:
+        client.get_balance()
+
+    assert not isinstance(err.value, VastAmbiguousCreateError)
+
+
+@responses.activate
+def test_every_request_passes_a_timeout(client):
+    responses.post(f"{BASE}/bundles/", json={"offers": []})
+    responses.put(f"{BASE}/asks/7/", json={"new_contract": 1})
+    responses.get(f"{BASE}/instances/1/", json={"instances": raw_instance(id=1)})
+    responses.get(f"{V1}/instances", json={"instances": []})
+    responses.delete(f"{BASE}/instances/1/", json={"success": True})
+    responses.get(f"{BASE}/users/current/", json={"balance": 1})
+    responses.post(f"{BASE}/ssh/", json={"success": True})
+
+    client.search_offers()
+    client.create_instance(7, "img", "gputx-x", 40, "true", {})
+    client.get_instance(1)
+    client.list_instances("gputx-")
+    client.destroy_instance(1)
+    client.get_balance()
+    client.register_ssh_key("ssh-ed25519 AAAA")
+
+    assert len(responses.calls) == 7
+    for call in responses.calls:
+        timeout = call.request.req_kwargs["timeout"]
+        assert isinstance(timeout, (int, float)) and timeout > 0

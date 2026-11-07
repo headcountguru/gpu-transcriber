@@ -74,6 +74,19 @@ class VastError(RuntimeError):
         self.status_code = status_code
 
 
+class VastAmbiguousCreateError(VastError):
+    """Renting a machine timed out after the request was sent, so one may exist.
+
+    Callers must look for instances with their label (``list_instances``) before retrying,
+    otherwise a retry could rent a second machine and leave the first one billing.
+    """
+
+    maybe_created: bool = True
+
+    def __init__(self) -> None:
+        super().__init__("Vast.ai did not answer in time; a machine may have been rented")
+
+
 @dataclass(frozen=True)
 class Offer:
     """A rentable machine, with Vast.ai's units converted (GB, Mb/s, dollars per hour)."""
@@ -189,9 +202,14 @@ class VastClient:
 
     # --- public API -------------------------------------------------------------------------
 
-    def search_offers(self) -> list[Offer]:
-        """Return rentable, verified, single-GPU on-demand offers, cheapest first."""
-        body = {
+    def search_offers(self, settings: Settings | None = None) -> list[Offer]:
+        """Return rentable, verified, single-GPU on-demand offers, cheapest first.
+
+        When ``settings`` is given, its minimums and price ceiling are also sent to Vast.ai as
+        search filters, so cheap unsuitable machines cannot crowd suitable ones out of the
+        result. ``rank_offers`` remains the final client-side check.
+        """
+        body: dict[str, Any] = {
             "type": "ondemand",
             "verified": {"eq": True},
             "rentable": {"eq": True},
@@ -200,6 +218,16 @@ class VastClient:
             "limit": SEARCH_LIMIT,
             "order": [["dph_total", "asc"]],
         }
+        if settings is not None:
+            body.update(
+                {
+                    "gpu_ram": {"gte": settings.min_vram_gb * MB_PER_GB},
+                    "dph_total": {"lte": settings.max_price_per_hour},
+                    "reliability": {"gte": settings.min_reliability},
+                    "inet_down": {"gte": settings.min_down_mbps},
+                    "cuda_max_good": {"gte": settings.min_cuda},
+                }
+            )
         data = self._call("POST", f"{self._base_url}/bundles/", "search for machines", json=body)
         raw_offers = data.get("offers") if isinstance(data, dict) else None
         parsed = [_parse_offer(raw) for raw in raw_offers or []]
@@ -226,7 +254,9 @@ class VastClient:
             "env": env,
             "cancel_unavail": True,
         }
-        data = self._call("PUT", f"{self._base_url}/asks/{offer_id}/", what, json=body)
+        data = self._call(
+            "PUT", f"{self._base_url}/asks/{offer_id}/", what, json=body, ambiguous_timeout=True
+        )
         new_id = data.get("new_contract") if isinstance(data, dict) else None
         if not isinstance(new_id, int) or isinstance(new_id, bool):
             raise VastError(f"Could not {what}: Vast.ai did not return an instance id.")
@@ -307,8 +337,13 @@ class VastClient:
         params: dict[str, Any] | None = None,
         allow_not_found: bool = False,
         require_json: bool = True,
+        ambiguous_timeout: bool = False,
     ) -> Any:
-        """Send a request and return the decoded JSON body (None for an allowed 404)."""
+        """Send a request and return the decoded JSON body (None for an allowed 404).
+
+        With ``ambiguous_timeout`` (used for renting), a read timeout means the request was sent
+        but its outcome is unknown, so it raises ``VastAmbiguousCreateError``.
+        """
         try:
             response = self._session.request(
                 method,
@@ -321,6 +356,8 @@ class VastClient:
         except requests.RequestException as exc:
             # Deliberately not chained: the original message could echo request details.
             logger.warning("Vast.ai request to %s failed: %s", what, type(exc).__name__)
+            if ambiguous_timeout and isinstance(exc, requests.ReadTimeout):
+                raise VastAmbiguousCreateError() from None
             raise VastError(
                 f"Could not {what}: could not reach Vast.ai. Check the internet connection."
             ) from None
