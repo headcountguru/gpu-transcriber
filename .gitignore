@@ -11,3 +11,6 @@ build/
 .coverage
 htmlcov/
 *.egg-info/
+
+# live smoke downloads (the markdown reports are committed)
+docs/measurements/*/
