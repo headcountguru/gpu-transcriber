@@ -52,6 +52,30 @@ class CredentialStore:
         except Exception as exc:
             raise self._failure("save", name, exc) from None
 
+    def set_all(self, values: dict[str, str]) -> None:
+        """Save several secrets: all of them, or none (earlier ones are put back on failure).
+
+        Raises ``CredentialError`` for the save that failed. If putting an earlier secret back
+        also fails, that is logged (by name only) and the original failure is still raised.
+        """
+        previous = {name: self.get(name) for name in values}
+        written: list[str] = []
+        try:
+            for name, value in values.items():
+                self.set(name, value)
+                written.append(name)
+        except CredentialError:
+            for name in reversed(written):
+                old = previous[name]
+                try:
+                    if old is None:
+                        self.delete(name)
+                    else:
+                        self.set(name, old)
+                except CredentialError:
+                    logger.error("Could not put back the previous %s after a failed save", name)
+            raise
+
     def delete(self, name: str) -> None:
         """Remove a secret. Removing one that does not exist is not an error."""
         backend = self._resolve_backend()

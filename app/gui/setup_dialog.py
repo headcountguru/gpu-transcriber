@@ -279,8 +279,7 @@ class SetupDialog(QDialog):
             return
         vast_key, hf_token = self._secrets
         try:
-            self._creds.set(VAST_API_KEY, vast_key)
-            self._creds.set(HF_TOKEN, hf_token)
+            self._creds.set_all({VAST_API_KEY: vast_key, HF_TOKEN: hf_token})  # both or neither
         except CredentialError as exc:
             self._set_status(self.form_status, str(exc), theme.KIND_FAILED)
             return

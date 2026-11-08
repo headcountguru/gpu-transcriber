@@ -101,3 +101,39 @@ def test_default_backend_is_the_keyring_module_loaded_lazily() -> None:
 
     store = CredentialStore()  # must not touch the real credential manager on construction
     assert store._resolve_backend() is keyring
+
+
+class FailAfterFirstWrite(FakeBackend):
+    """The first save works; every later save or removal fails."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.writes = 0
+
+    def set_password(self, service: str, name: str, value: str) -> None:
+        self.writes += 1
+        if self.writes > 1:
+            raise RuntimeError(f"locked while saving {value}")
+        super().set_password(service, name, value)
+
+    def delete_password(self, service: str, name: str) -> None:
+        raise RuntimeError("locked")
+
+
+def test_set_all_saves_every_value() -> None:
+    backend = FakeBackend()
+    CredentialStore(backend=backend).set_all({VAST_API_KEY: "v-key", HF_TOKEN: "h-token"})
+
+    assert sorted(backend.data.values()) == ["h-token", "v-key"]
+
+
+def test_set_all_reports_a_failed_put_back_by_name_only(caplog: pytest.LogCaptureFixture) -> None:
+    backend = FailAfterFirstWrite()
+    store = CredentialStore(backend=backend)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(CredentialError) as err:
+        store.set_all({VAST_API_KEY: "v-key-SECRET", HF_TOKEN: "h-token-SECRET"})
+
+    assert "SECRET" not in str(err.value)
+    assert "SECRET" not in caplog.text
+    assert VAST_API_KEY in caplog.text  # the first key could not be removed again

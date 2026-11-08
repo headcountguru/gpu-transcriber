@@ -180,3 +180,33 @@ def test_empty_fields_ask_for_both_values(qtbot: object) -> None:
     assert not dialog.is_checking()
     assert backend.data == {}
     assert "Paste" in dialog.vast_status.text()
+
+
+class SecondWriteFails(FakeBackend):
+    """Saving the Hugging Face token fails; everything else works."""
+
+    def set_password(self, service: str, name: str, value: str) -> None:
+        if name == HF_TOKEN:
+            raise OSError("Credential Manager is locked")
+        super().set_password(service, name, value)
+
+
+@pytest.mark.parametrize("had_old_key", [True, False], ids=["old-key-restored", "no-old-key"])
+def test_failed_second_save_leaves_the_first_key_as_it_was(
+    qtbot: object, caplog: pytest.LogCaptureFixture, had_old_key: bool
+) -> None:
+    backend = SecondWriteFails()
+    if had_old_key:
+        backend.data[(SERVICE, VAST_API_KEY)] = "OLDVASTKEY1234567890"
+    dialog = build(qtbot, backend, check_vast=lambda key: 5.0, check_hf=lambda token: granted())
+
+    with caplog.at_level(logging.DEBUG):
+        submit(qtbot, dialog)
+
+    expected = {(SERVICE, VAST_API_KEY): "OLDVASTKEY1234567890"} if had_old_key else {}
+    assert backend.data == expected  # both or neither
+    assert dialog.result() != SetupDialog.DialogCode.Accepted
+    shown = dialog.form_status.text()
+    assert shown and VAST_KEY not in shown and HF not in shown
+    assert VAST_KEY not in caplog.text and HF not in caplog.text
+    assert "OLDVASTKEY1234567890" not in shown
