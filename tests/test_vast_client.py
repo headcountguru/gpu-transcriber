@@ -97,6 +97,8 @@ def test_settings_defaults_match_the_spec():
 
 def test_app_data_dir_is_created_under_appdata(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.delenv("GPU_TRANSCRIBER_HOME", raising=False)
+    monkeypatch.setattr("app.settings.sys.base_prefix", r"C:\Python312")  # not the Store Python
     path = app_data_dir()
     assert path == tmp_path / "GpuTranscriber"
     assert path.is_dir()

@@ -581,3 +581,23 @@ def test_prepare_youtube_clears_stale_downloads_and_ignores_partial_files(
 
     assert seen == [False]
     assert prepared.duration_s == pytest.approx(2.0, abs=0.2)
+
+
+def test_output_folder_problem_is_not_reported_as_a_missing_input_file(tmp_path: Path) -> None:
+    # Seen live: ffmpeg could not write into the app's working folder and said "No such file or
+    # directory" about its OUTPUT, which used to be shown as "Can't find that file" (the input).
+    source = make_wav(tmp_path / "in.wav")
+
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        if "-c:a" in args:  # the conversion step
+            return subprocess.CompletedProcess(
+                args, 4294967294, "", f"{args[-1]}: No such file or directory\n"
+            )
+        return subprocess.run(args, **kwargs)  # type: ignore[call-overload]  # the real probe
+
+    with pytest.raises(MediaPrepError) as caught:
+        prepare_file(source, tmp_path / "work", FFMPEG, run=run)
+
+    message = str(caught.value)
+    assert "find that file" not in message
+    assert "working folder" in message

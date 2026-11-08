@@ -1,6 +1,7 @@
 """Shared application settings and the per-user data directory."""
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,7 @@ IMAGE = (
 )
 
 APP_DATA_DIR_NAME = "GpuTranscriber"
+DATA_DIR_ENV = "GPU_TRANSCRIBER_HOME"
 
 
 @dataclass(frozen=True)
@@ -35,9 +37,26 @@ class Settings:
 
 
 def app_data_dir() -> Path:
-    """Return ``%APPDATA%/GpuTranscriber``, creating it if it does not exist yet."""
-    appdata = os.environ.get("APPDATA")
-    root = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
-    path = root / APP_DATA_DIR_NAME
+    """Return the folder for jobs, tools, logs and the SSH key, creating it if needed.
+
+    Normally ``%APPDATA%/GpuTranscriber``. Set ``GPU_TRANSCRIBER_HOME`` to use another folder. Under
+    the Microsoft Store build of Python the app keeps its data in ``~/GpuTranscriber`` instead,
+    because that Python hides writes under ``AppData`` in a private copy that ffmpeg and yt-dlp
+    cannot see.
+    """
+    override = os.environ.get(DATA_DIR_ENV)
+    if override:
+        path = Path(override)
+    elif _runs_under_store_python():
+        path = Path.home() / APP_DATA_DIR_NAME
+    else:
+        appdata = os.environ.get("APPDATA")
+        root = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+        path = root / APP_DATA_DIR_NAME
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _runs_under_store_python() -> bool:
+    """True for the Microsoft Store Python, which redirects ``AppData`` writes (see above)."""
+    return sys.platform == "win32" and "WindowsApps" in sys.base_prefix

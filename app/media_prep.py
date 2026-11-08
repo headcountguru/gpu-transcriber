@@ -48,6 +48,10 @@ MSG_UNREADABLE = "Can't read this file. It may be damaged or not an audio or vid
 MSG_EMPTY = "This file is empty (it has no content)."
 MSG_MISSING = "Can't find that file. It may have been moved or deleted."
 MSG_CONVERT_FAILED = "Could not convert this file to audio."
+MSG_WORKING_FOLDER = (
+    "Could not save the converted audio in the app's working folder. Your file is fine. "
+    "Check that the app's data folder can be written to, then try again."
+)
 MSG_PLAYLIST = "Playlists are not supported. Paste the link to a single video instead."
 MSG_NOT_A_LINK = "That doesn't look like a web link. Paste the full link to a YouTube video."
 MSG_NOT_SINGLE_VIDEO = (
@@ -110,7 +114,9 @@ _FFMPEG_PROBLEMS: tuple[tuple[tuple[str, ...], str], ...] = (
         MSG_NO_AUDIO,
     ),
     (("invalid data found", "moov atom not found", "could not find codec"), MSG_UNREADABLE),
-    (("no such file", "does not exist"), MSG_MISSING),
+    # The input file was already checked to exist, so a "no such file" from ffmpeg is about the
+    # place it writes the converted audio to (seen live under the Microsoft Store Python).
+    (("no such file", "does not exist"), MSG_WORKING_FOLDER),
 )
 
 Run = Callable[..., Any]
