@@ -43,7 +43,7 @@ Public. (Optionally link the package to the repo on the same page.)
 
 Set `IMAGE` in `app/settings.py` to the digest reference from the job summary, for example
 `IMAGE = "ghcr.io/<owner>/gpu-transcriber@sha256:<digest>"`. It currently holds the digest of the
-`image-0.2` build.
+`image-0.3` build.
 
 ## Run the contract test by hand
 
