@@ -270,6 +270,14 @@ def _check_youtube_url(url: str) -> str:
     raise MediaPrepError(MSG_NOT_SINGLE_VIDEO)
 
 
+def check_youtube_url(url: str) -> str:
+    """Return the trimmed link if it is one YouTube video; else raise a plain MediaPrepError.
+
+    Checks the text only (no network), so the window can enable Play as the user types.
+    """
+    return _check_youtube_url(url)
+
+
 def _ytdlp_base(ytdlp_exe: Path, ffmpeg_exe: str, cookies_file: Path | None) -> list[str]:
     command = [str(ytdlp_exe), "--no-playlist", "--no-warnings", "--ffmpeg-location", ffmpeg_exe]
     if cookies_file is not None:
