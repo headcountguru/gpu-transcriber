@@ -688,7 +688,9 @@ class Orchestrator:
     # --- shutting machines down -----------------------------------------------------------------
 
     def _destroy(self, instance_id: int) -> bool:
-        return destroy_and_confirm(self._vast, instance_id, self._clock, self._sleep)
+        return destroy_and_confirm(
+            self._vast, instance_id, self._clock, self._sleep, self._settings.label_prefix
+        )
 
     def _settle(
         self, ctx: _JobRun, state: JobState, message: str, error: str | None = None

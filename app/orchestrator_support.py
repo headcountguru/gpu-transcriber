@@ -184,11 +184,17 @@ def pull_outputs(session: RemoteSession, remote_dir: str, local_dir: Path) -> li
 
 
 def destroy_and_confirm(
-    vast: VastLike, instance_id: int, clock: Callable[[], float], sleep: Callable[[float], None]
+    vast: VastLike,
+    instance_id: int,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+    label_prefix: str,
 ) -> bool:
     """Destroy the instance (three tries), then confirm Vast.ai no longer lists it.
 
     A 404 from destroy means it is already gone. False means it may still be billing.
+    Gone is confirmed only when the instance lookup says gone AND the listing of
+    ``label_prefix`` machines no longer shows it (Vast.ai can be briefly inconsistent).
     """
     for attempt in range(1, DESTROY_ATTEMPTS + 1):
         try:
@@ -204,16 +210,22 @@ def destroy_and_confirm(
                 sleep(DESTROY_RETRY_S)
         else:
             break
-    return _confirm_gone(vast, instance_id, clock, sleep)
+    return _confirm_gone(vast, instance_id, clock, sleep, label_prefix)
 
 
 def _confirm_gone(
-    vast: VastLike, instance_id: int, clock: Callable[[], float], sleep: Callable[[float], None]
+    vast: VastLike,
+    instance_id: int,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+    label_prefix: str,
 ) -> bool:
     deadline = clock() + CONFIRM_GONE_TIMEOUT_S
     while True:
         try:
-            if vast.get_instance(instance_id) is None:
+            if vast.get_instance(instance_id) is None and not any(
+                item.id == instance_id for item in vast.list_instances(label_prefix)
+            ):
                 logger.info("Confirmed instance %s is gone", instance_id)
                 return True
         except VastError as exc:

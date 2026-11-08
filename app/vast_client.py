@@ -34,7 +34,8 @@ still pass a 16 GB minimum). ``inet_down`` is already Mb/s (CLI docs), so it is 
 # UNCONFIRMED: ``show instances`` is documented only as ``/api/v1/instances`` (paged); we derive
 # UNCONFIRMED: the v1 URL from ``base_url``. Legacy ``GET /api/v0/instances/`` is the fallback.
 # UNCONFIRMED: what ``GET /instances/{id}/`` returns for a destroyed instance (404 vs 200 with an
-# UNCONFIRMED: empty ``instances``); both are treated as "gone". ``instances`` is a single object.
+# UNCONFIRMED: empty ``instances``); both are treated as "gone", but a 200 reply with no
+# UNCONFIRMED: ``instances`` key (or an unreadable one) raises. ``instances`` is a single object.
 # UNCONFIRMED: ``actual_status`` is null while an instance is still being set up; we report that
 # UNCONFIRMED: as ``"pending"``. Other values (``loading``, ``running``, ``exited``, ``offline``,
 # UNCONFIRMED: ``unknown``) are passed through; the docs say ``exited``/``unknown``/``offline``
@@ -99,6 +100,7 @@ class Offer:
     reliability: float
     datacenter: bool
     cuda_max_good: float
+    machine_id: int | None = None  # the host behind the offer; several offers can share one
 
 
 @dataclass(frozen=True)
@@ -159,10 +161,20 @@ def _parse_offer(raw: Any) -> Offer | None:
             reliability=float(raw["reliability"]),
             datacenter=int(raw.get("hosting_type") or 0) >= 1,
             cuda_max_good=float(raw["cuda_max_good"]),
+            machine_id=_optional_int(raw.get("machine_id")),
         )
     except (KeyError, TypeError, ValueError, AttributeError):
         offer_id = raw.get("id") if isinstance(raw, dict) else None
         logger.debug("Skipping offer %s: missing or unreadable field", offer_id)
+        return None
+
+
+def _optional_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
         return None
 
 
@@ -264,16 +276,28 @@ class VastClient:
         return new_id
 
     def get_instance(self, instance_id: int) -> Instance | None:
-        """Return the instance, or None if it no longer exists."""
+        """Return the instance, or None if it no longer exists.
+
+        None only for a 404 or an explicitly empty ``instances`` (null, ``{}`` or ``[]``). Any
+        other reply that does not describe this instance raises ``VastError``: callers decide
+        "destroyed" or "rent a replacement" from None, so a bad reply must never look like it.
+        """
         what = f"check instance {instance_id}"
         data = self._call(
             "GET", f"{self._base_url}/instances/{instance_id}/", what, allow_not_found=True
         )
-        raw = data.get("instances") if isinstance(data, dict) else None
+        if data is None:
+            return None  # 404
+        unreadable = VastError(f"Could not {what}: Vast.ai sent an answer that is not readable.")
+        if not isinstance(data, dict) or "instances" not in data:
+            raise unreadable
+        raw = data["instances"]
+        if raw is None or raw == {} or raw == []:
+            return None
         if isinstance(raw, list):
             raw = next((r for r in raw if isinstance(r, dict) and r.get("id") == instance_id), None)
-        if not raw:
-            return None
+        if not isinstance(raw, dict):
+            raise unreadable
         return _parse_instance(raw)
 
     def list_instances(self, label_prefix: str) -> list[Instance]:
@@ -289,8 +313,18 @@ class VastClient:
             page = data.get("instances") if isinstance(data, dict) else None
             for raw in page or []:
                 label = raw.get("label") if isinstance(raw, dict) else None
-                if isinstance(label, str) and label.startswith(label_prefix):
+                if not isinstance(label, str) or not label.startswith(label_prefix):
+                    continue
+                try:
                     found.append(_parse_instance(raw))
+                except VastError:
+                    # Skipped so one bad row cannot block reaping and resuming. It carries the
+                    # app's label, so it may be a machine of ours: say so (without its contents).
+                    logger.warning(
+                        "Vast.ai listed a machine with the app's label that could not be read; "
+                        "it was skipped. Check the Vast.ai console for machines labelled %s*.",
+                        label_prefix,
+                    )
             token = data.get("next_token") if isinstance(data, dict) else None
             if not token:
                 return found
