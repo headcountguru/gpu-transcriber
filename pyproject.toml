@@ -14,6 +14,10 @@ app = [
     "keyring",
     "imageio-ffmpeg",
 ]
+# Only needed to build the Windows exe (scripts/build_exe.ps1).
+build = [
+    "pyinstaller",
+]
 dev = [
     "pytest",
     "pytest-cov",
