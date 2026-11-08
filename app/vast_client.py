@@ -384,7 +384,11 @@ class VastClient:
     def _http_error(self, what: str, response: requests.Response) -> VastError:
         status = response.status_code
         if status in (401, 403):
-            message = f"Could not {what}: Vast.ai did not accept the API key. Check it in Settings."
+            message = (
+                f"Could not {what}: Vast.ai refused the API key (HTTP {status}). The key may be "
+                "wrong or deleted, or it may not have permission for this step. Check the key and "
+                "its permissions in your Vast.ai account."
+            )
         elif status == 429:
             message = (
                 f"Could not {what}: too many requests were sent to Vast.ai. Try again shortly."

@@ -419,6 +419,19 @@ def test_bad_api_key_gives_a_plain_message_without_the_key(client):
 
 
 @responses.activate
+@pytest.mark.parametrize("status", [401, 403])
+def test_refused_key_message_names_the_http_code_and_the_permissions_possibility(client, status):
+    responses.post(f"{BASE}/ssh/", status=status, json={"msg": f"no access for {API_KEY}"})
+    with pytest.raises(VastError) as err:
+        client.register_ssh_key("ssh-ed25519 AAAA")
+    message = str(err.value)
+    assert f"HTTP {status}" in message
+    assert "permission" in message
+    assert API_KEY not in message
+    assert err.value.status_code == status
+
+
+@responses.activate
 def test_long_response_bodies_are_truncated_in_errors(client):
     responses.delete(f"{BASE}/instances/5/", status=500, body="x" * 5000)
     with pytest.raises(VastError) as err:
