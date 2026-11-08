@@ -478,9 +478,139 @@ def test_destroy_failure_is_retried_and_reported(world: World) -> None:
     other.vast.destroy_always_fails = True
     failed = other.submit_and_run()
     instance_id = next(iter(other.vast.instances))
+    assert failed.state is JobState.DONE  # the transcript is real; only the shutdown is unsure
     assert "may still be running" in failed.message
     assert str(instance_id) in failed.message
     assert failed.instance_id == instance_id
+
+
+# --- review fixes --------------------------------------------------------------------------------
+
+
+def test_lost_machine_with_too_little_cap_left_stops_at_cap_and_can_continue(
+    world: World,
+) -> None:
+    # Machine one dies after spending $0.20 of a $0.95 cap: $0.75 cannot cover a 15-minute
+    # start-up of a replacement ($0.90), so the job must stop at its cap, not fail.
+    world.plans = [FakeMachine(chunks=3, die_after=2), FakeMachine(chunks=3)]
+    stopped = world.submit_and_run(cap=0.95)
+
+    assert stopped.state is JobState.STOPPED_AT_CAP
+    assert len(world.vast.created) == 1
+    assert world.ckpt_names(stopped.id) == ["diar_000.json", "words.json"]
+    assert world.vast.instances == {}
+
+    world.orch.raise_cap_and_continue(stopped.id, 5.0)
+    job = world.orch.run(stopped.id, world.updates.append)
+
+    assert job.state is JobState.DONE
+    second = world.machines[max(world.machines)]
+    assert second.checkpoints_at_launch == ["diar_000.json", "words.json"]
+    assert second.computed == ["diar_001.json", "diar_002.json"]
+
+
+def test_unconfirmed_destroy_keeps_billing_visible_until_retried(world: World) -> None:
+    world.vast.destroy_always_fails = True
+    job = world.submit_and_run()
+    instance_id = next(iter(world.vast.instances))
+
+    assert job.state is JobState.DONE
+    assert job.instance_id == instance_id
+    assert job.machine_started_at == 0.0
+    assert "may still be running" in job.message and str(instance_id) in job.message
+    assert job.cost_so_far == pytest.approx(world.clock.now * PRICE / 3600)
+
+    world.vast.destroy_always_fails = False
+    world.clock.now += 60.0  # still billing until it is confirmed gone
+    settled = world.orch.retry_unconfirmed_destroys()
+
+    assert [j.id for j in settled] == [job.id]
+    fixed = world.store.get(job.id)
+    assert fixed.state is JobState.DONE
+    assert fixed.instance_id is None
+    assert fixed.machine_started_at is None
+    assert "may still be running" not in fixed.message
+    assert fixed.error is None
+    assert fixed.banked_cost == fixed.cost_so_far > job.cost_so_far
+    assert world.vast.instances == {}
+    assert world.orch.retry_unconfirmed_destroys() == []
+
+
+def test_retry_unconfirmed_destroys_leaves_job_alone_when_still_failing(world: World) -> None:
+    world.vast.destroy_always_fails = True
+    job = world.submit_and_run()
+
+    assert world.orch.retry_unconfirmed_destroys() == []
+    assert world.store.get(job.id) == job
+
+
+def test_reap_orphans_settles_unconfirmed_destroys_first(world: World) -> None:
+    world.vast.destroy_always_fails = True
+    job = world.submit_and_run()
+    instance_id = job.instance_id
+    world.vast.destroy_always_fails = False
+
+    reaped = world.orch.reap_orphans()
+
+    assert reaped == []  # settled by the retry, so the sweep had nothing left to reap
+    assert world.store.get(job.id).instance_id is None
+    assert instance_id not in world.vast.instances
+
+
+def test_cap_still_enforced_when_continuing_after_an_unconfirmed_destroy(world: World) -> None:
+    world.vast.destroy_always_fails = True
+    world.plans = [FakeMachine(chunks=40)]
+    stopped = world.submit_and_run(cap=0.95)
+    assert stopped.state is JobState.STOPPED_AT_CAP
+    assert stopped.instance_id is not None
+    assert stopped.machine_started_at == 0.0
+
+    with pytest.raises(ValueError):
+        world.orch.raise_cap_and_continue(stopped.id, stopped.cost_so_far)
+    world.orch.raise_cap_and_continue(stopped.id, 1.5)
+    again = world.orch.run(stopped.id, world.updates.append)
+
+    assert again.state is JobState.STOPPED_AT_CAP
+    assert len(world.vast.created) == 1  # it went back to the same machine
+    # Billing still counts from the first machine's create call at t=0.
+    assert again.cost_so_far == pytest.approx(world.clock.now * PRICE / 3600)
+    assert again.cost_so_far >= 1.5
+
+
+def test_reattach_without_start_time_bills_from_job_creation(world: World) -> None:
+    job = world.orch.submit("C:/audio/talk.mp3", is_youtube=False)  # created at t=0
+    world.store.save(job.with_(state=JobState.STARTING_MACHINE, price_per_hour=PRICE))
+    world.vast.add_instance(f"gputx-{job.id}")
+    world.clock.now = 500.0
+
+    assert world.orch.resume_pending() == [job.id]
+    assert world.store.get(job.id).machine_started_at == job.created_at
+
+
+def test_same_job_cannot_run_twice_at_once(world: World) -> None:
+    job = world.orch.submit("C:/audio/talk.mp3", is_youtube=False)
+    second_result: list[BaseException | Job] = []
+
+    def second_run() -> None:
+        try:
+            second_result.append(world.orch.run(job.id, lambda _job: None))
+        except RuntimeError as exc:
+            second_result.append(exc)
+
+    def on_update(current: Job) -> None:
+        if current.state is JobState.STARTING_MACHINE and not second_result:
+            other = threading.Thread(target=second_run)
+            other.start()
+            other.join()
+
+    first = world.orch.run(job.id, on_update)
+
+    assert first.state is JobState.DONE
+    assert len(world.vast.created) == 1
+    assert isinstance(second_result[0], RuntimeError)
+    assert "already running" in str(second_result[0])
+    # Once the first run has finished, the id is released again.
+    assert world.orch.run(job.id, lambda _job: None).state is JobState.DONE
 
 
 def test_resume_pending_finds_instance_by_label_when_id_not_saved(world: World) -> None:

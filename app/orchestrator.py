@@ -12,6 +12,18 @@ Billing safety, in order of importance:
   - The spending cap is a hard limit, checked at every wait, upload callback and poll.
   - The machine's start-up script runs the on-machine watchdog, so a machine whose app died
     still destroys itself.
+  - The same job is never run twice at once (a second ``run`` raises ``JobAlreadyRunningError``),
+    so it can never rent two machines.
+
+Invariant: a job in a final state whose ``instance_id`` is still set means "the destroy was not
+confirmed, so the machine may still be running". Its ``machine_started_at`` is kept too, so its
+cost keeps counting and its cap keeps being enforced. ``retry_unconfirmed_destroys`` (also run
+by ``reap_orphans``) settles such jobs once Vast.ai confirms the machine is gone.
+
+The cap can be overshot by a bounded amount: up to one poll interval, the time to download
+checkpoints and outputs, the destroy and its confirmation (up to about 100 s), the SSH connect
+retries inside ``session_factory`` (not interruptible from here), and the 180 s label sweep
+after an unclear create.
 
 Secrets: the Vast.ai key and Hugging Face token are scrubbed from every message and error saved
 on a job and from every log line written here. The token reaches the machine only through the
@@ -45,6 +57,7 @@ from app.orchestrator_support import (
     reattach,
     runner_command,
     scrub,
+    settled_job,
     still_running_text,
     sweep_label,
 )
@@ -80,9 +93,14 @@ MSG_NO_OFFER = "No suitable machine is available right now. Nothing was rented. 
 MSG_NO_TOKEN = "Add your Hugging Face token in Settings before starting a job."
 MSG_CANCELLED = "Cancelled. Nothing more will be charged for this job."
 MSG_DONE = "Done. The transcript is saved."
+MSG_ALREADY_RUNNING = "This job is already running."
 MSG_KEY_REFUSED = (
     "Could not set up access to the rented machine: Vast.ai kept refusing the app's SSH key."
 )
+
+
+class JobAlreadyRunningError(RuntimeError):
+    """``run`` was called for a job that is already running; nothing was done."""
 
 
 class _Stop(Exception):
@@ -164,6 +182,8 @@ class Orchestrator:
         self._max_retries = (
             settings.max_machine_retries if max_machine_retries is None else max_machine_retries
         )
+        self._running: set[str] = set()
+        self._running_lock = threading.Lock()
 
     # --- public API -----------------------------------------------------------------------------
 
@@ -190,8 +210,25 @@ class Orchestrator:
     def run(
         self, job_id: str, on_update: Callable[[Job], None], cancel: threading.Event | None = None
     ) -> Job:
-        """Drive the job to a final state (blocking). Returns the final job."""
-        ctx = _JobRun(self._store, self._store.get(job_id), on_update, cancel or threading.Event())
+        """Drive the job to a final state (blocking). Returns the final job.
+
+        Raises ``JobAlreadyRunningError`` (a ``RuntimeError``) if this job is already being run,
+        so the window can say "This job is already running" instead of renting a second machine.
+        """
+        with self._running_lock:
+            if job_id in self._running:
+                raise JobAlreadyRunningError(MSG_ALREADY_RUNNING)
+            self._running.add(job_id)
+        try:
+            return self._run_claimed(job_id, on_update, cancel or threading.Event())
+        finally:
+            with self._running_lock:
+                self._running.discard(job_id)
+
+    def _run_claimed(
+        self, job_id: str, on_update: Callable[[Job], None], cancel: threading.Event
+    ) -> Job:
+        ctx = _JobRun(self._store, self._store.get(job_id), on_update, cancel)
         if ctx.job.state in TERMINAL_STATES:
             return ctx.job
         try:
@@ -243,8 +280,9 @@ class Orchestrator:
         """Destroy labelled machines whose job is finished or unknown. Returns the ids destroyed.
 
         A machine belonging to an unfinished job is never touched, nor is one without the
-        app's label prefix.
+        app's label prefix. Jobs with an unconfirmed destroy are settled first.
         """
+        self.retry_unconfirmed_destroys()
         prefix = self._settings.label_prefix
         destroyed: list[int] = []
         for instance in self._vast.list_instances(prefix):
@@ -259,15 +297,40 @@ class Orchestrator:
                 logger.critical("Orphaned machine %s may still be running", instance.id)
         return destroyed
 
+    def retry_unconfirmed_destroys(self) -> list[Job]:
+        """Retry shutting down machines of finished jobs whose destroy was never confirmed.
+
+        On success the job keeps its outcome, its machine fields and the warning are cleared,
+        and its cost is banked. Jobs still unconfirmed are left untouched. Returns the jobs
+        settled. Safe to call periodically.
+        """
+        settled: list[Job] = []
+        for job in self._store.load_all():
+            if job.state not in TERMINAL_STATES or job.instance_id is None:
+                continue
+            with self._running_lock:
+                if job.id in self._running:
+                    continue
+            if not self._destroy(job.instance_id):
+                continue
+            updated = settled_job(job, self._cost(job))
+            self._store.save(updated)
+            settled.append(updated)
+            logger.info("Machine %s of job %s is now confirmed gone", job.instance_id, job.id)
+        return settled
+
     def raise_cap_and_continue(self, job_id: str, new_cap: float) -> Job:
-        """Give a job stopped at its cap a higher cap; ``run`` then resumes from its checkpoints."""
+        """Give a job stopped at its cap a higher cap; ``run`` then resumes from its checkpoints.
+
+        If the job's machine was never confirmed gone, ``run`` goes back to it (its billing time
+        still counts towards the cap).
+        """
         job = self._store.get(job_id)
         if job.state is not JobState.STOPPED_AT_CAP:
             raise ValueError("Only a job stopped at its spending cap can continue.")
-        if not math.isfinite(new_cap) or new_cap <= job.banked_cost:
-            raise ValueError(
-                f"The new cap must be more than the ${job.banked_cost:.2f} already spent."
-            )
+        spent = max(job.banked_cost, self._cost(job))
+        if not math.isfinite(new_cap) or new_cap <= spent:
+            raise ValueError(f"The new cap must be more than the ${spent:.2f} already spent.")
         updated = job.with_(
             state=JobState.PREPARING,
             cost_cap=new_cap,
@@ -385,10 +448,14 @@ class Orchestrator:
                 f"(${remaining:.2f}). Add credit or lower the cap. Nothing was rented."
             )
         if offer.dph_total * STARTUP_BUDGET_HOURS > remaining:
+            if job.banked_cost > 0:
+                # A machine was already paid for (e.g. a replacement is needed): the cap is what
+                # ran out, so stop at the cap; the user can raise it and continue.
+                raise _CapReached()
             raise _JobFailed(
                 f"The cheapest suitable machine costs ${offer.dph_total:.2f} an hour, which the "
-                f"spending cap (${remaining:.2f} left) cannot cover even for start-up. "
-                "Raise the cap. Nothing was rented."
+                f"spending cap (${remaining:.2f}) cannot cover even for start-up. "
+                "Choose a higher cap and start the job again. Nothing was rented."
             )
         ctx.save(cost_cap=cap, price_per_hour=offer.dph_total)
         return offer
@@ -626,18 +693,24 @@ class Orchestrator:
     def _settle(
         self, ctx: _JobRun, state: JobState, message: str, error: str | None = None
     ) -> None:
-        """Shut down the job's machine (if any), bank its cost and save the final state."""
+        """Shut down the job's machine (if any), bank its cost and save the final state.
+
+        If the shutdown is not confirmed, ``instance_id`` and ``machine_started_at`` stay set
+        (the machine may still be billing) and the message says so; see the module docstring.
+        """
         changes: dict[str, object] = {"state": state, "message": message, "error": error}
         instance_id = ctx.job.instance_id
-        if instance_id is not None:
-            if self._destroy(instance_id):
-                changes["instance_id"] = None
-            else:
-                warning = still_running_text(instance_id)
-                changes["message"] = f"{message} {warning}"
-                changes["error"] = f"{error} {warning}" if error else warning
+        if instance_id is not None and not self._destroy(instance_id):
+            warning = still_running_text(instance_id)
+            changes["message"] = f"{message} {warning}"
+            changes["error"] = f"{error} {warning}" if error else warning
+            changes["cost_so_far"] = self._cost(ctx.job)
+            ctx.save(**changes)
+            return
         cost = self._cost(ctx.job)
-        changes.update(banked_cost=cost, cost_so_far=cost, machine_started_at=None)
+        changes.update(
+            instance_id=None, banked_cost=cost, cost_so_far=cost, machine_started_at=None
+        )
         ctx.save(**changes)
 
     def _retire_lost_machine(self, ctx: _JobRun, reason: str) -> None:

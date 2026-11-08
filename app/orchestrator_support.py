@@ -270,7 +270,16 @@ def reattach(
         if extra.id != keep.id:
             logger.warning("Destroying a second machine %s for job %s", extra.id, job.id)
             destroy(extra.id)
-    started = job.machine_started_at if job.machine_started_at is not None else clock()
+    started = job.machine_started_at
+    if started is None:
+        # The app died between saving the job and saving the create time. Vast.ai's instance
+        # record (as parsed) has no start time, so assume billing ran since the job was made:
+        # this over-counts rather than under-counts against the cap.
+        started = job.created_at
+        logger.warning(
+            "Job %s had no machine start time; counting cost from when the job was created",
+            job.id,
+        )
     store.save(
         job.with_(
             instance_id=keep.id,
@@ -280,6 +289,24 @@ def reattach(
         )
     )
     logger.info("Job %s re-attached to machine %s", job.id, keep.id)
+
+
+def settled_job(job: Job, cost: float) -> Job:
+    """A finished job whose machine is now confirmed gone: clear its machine and the warning."""
+    warning = still_running_text(job.instance_id) if job.instance_id is not None else ""
+
+    def without_warning(text: str) -> str:
+        return text.replace(warning, "").strip() if warning else text
+
+    error = without_warning(job.error) if job.error else None
+    return job.with_(
+        instance_id=None,
+        machine_started_at=None,
+        banked_cost=cost,
+        cost_so_far=cost,
+        message=without_warning(job.message),
+        error=error or None,
+    )
 
 
 def mark_lost(store: JobStore, job: Job) -> None:
