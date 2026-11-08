@@ -13,6 +13,10 @@ pandas==2.2.2
 # frozen versions so every later build is identical. See docker/README.md.
 soundfile
 imageio-ffmpeg
+# TODO(pin): the machine's self-destroy (remote/watchdog.py) runs `vastai destroy instance`, so this
+# one matters most. Pin it to the exact version in the published image's pip-freeze artifact; that
+# version is not recorded anywhere in this repo, so it is deliberately not guessed here. The
+# contract test test_vastai_destroy_subcommand_exists checks the subcommand in the built image.
 vastai
 
 # numpy 2 is not safe here: the torch 2.5.1 base image was built against numpy 1.x, and

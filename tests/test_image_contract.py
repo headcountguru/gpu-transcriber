@@ -117,6 +117,19 @@ def test_vastai_cli_is_installed():
     _assert_ok(run_in_image(IMAGE, _PIP.format(args=", 'show', 'vastai'")))
 
 
+def test_vastai_destroy_subcommand_exists():
+    # The watchdog's self-destroy runs `vastai destroy instance <id> --api-key <key>`; `--help`
+    # proves that subcommand exists in this CLI version without any network call or key.
+    code = (
+        "import subprocess, sys\n"
+        "r = subprocess.run(['vastai', 'destroy', 'instance', '--help'],"
+        " capture_output=True, text=True, timeout=120)\n"
+        "print(r.stdout, r.stderr)\n"
+        "sys.exit(0 if r.returncode == 0 and 'instance' in (r.stdout + r.stderr) else 1)\n"
+    )
+    _assert_ok(run_in_image(IMAGE, code))
+
+
 def test_sshd_is_installed():
     _assert_ok(
         run_in_image(
