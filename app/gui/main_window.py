@@ -135,8 +135,15 @@ class ElidedLabel(QLabel):
 
 
 def plain_tooltip(text: str) -> str:
-    """Tooltips guess rich text like labels do; escaping makes job text show literally."""
-    return html.escape(text) if text else ""
+    """Job text as a tooltip that Qt shows exactly as written.
+
+    Tooltips guess rich text like labels do, and only text that looks like HTML is rendered.
+    Wrapping the escaped text in a paragraph makes Qt always render it, so ``&amp;`` and
+    ``&#x27;`` show as ``&`` and ``'`` and a name like ``<b>x</b>`` shows literally.
+    """
+    if not text:
+        return ""
+    return f'<p style="white-space:pre-wrap">{html.escape(text)}</p>'
 
 
 class JobListItem(QWidget):
