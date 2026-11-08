@@ -1,5 +1,6 @@
 """The runner always leaves a final status, keeps it fresh while alive, and bounds error text."""
 
+import sys
 import threading
 import time
 from pathlib import Path
@@ -159,3 +160,56 @@ def test_heartbeat_stops_after_a_failure(tmp_path: Path) -> None:
 
     assert not [t for t in threading.enumerate() if t.name == rj.HEARTBEAT_THREAD_NAME]
     assert read_status(job).state == "failed"
+
+
+# --- C8: a second runner on the same job never starts work ----------------------------------------
+
+
+def test_second_runner_exits_without_touching_the_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = make_job(tmp_path)
+    original = '{"state": "running", "stage": "labeling", "percent": 70, "message": "first"}'
+    (job / STATUS_FILE).write_text(original, encoding="utf-8")
+    steps = FakeSteps()
+    monkeypatch.setattr(rj, "_hold_runner_lock", lambda _job: None)
+
+    with pytest.raises(rj.RunnerAlreadyRunningError):
+        rj.run_job(str(job), TOKEN, steps=steps.as_pipeline_steps())
+
+    assert (job / STATUS_FILE).read_text(encoding="utf-8") == original
+    assert steps.transcribe_calls == 0
+
+
+def test_main_returns_one_for_a_second_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HF_TOKEN", TOKEN)
+    monkeypatch.setattr(rj, "_hold_runner_lock", lambda _job: None)
+
+    assert rj.main(["--job-dir", str(make_job(tmp_path))]) == rj.EXIT_FAILED
+
+
+def test_runner_lock_is_held_for_the_run_and_released_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    released: list[bool] = []
+    real = rj._hold_runner_lock
+
+    def tracking(job: Path) -> object:
+        release = real(job)
+        assert release is not None
+        if sys.platform != "win32":  # flock exists only where the runner really runs
+            assert real(job) is None  # a second runner is refused while the first holds it
+        return lambda: (released.append(True), release())  # type: ignore[misc]
+
+    monkeypatch.setattr(rj, "_hold_runner_lock", tracking)
+    job = make_job(tmp_path)
+
+    rj.run_job(str(job), TOKEN, steps=FakeSteps().as_pipeline_steps())
+
+    assert released == [True]
+    if sys.platform != "win32":
+        again = real(job)
+        assert again is not None
+        again()

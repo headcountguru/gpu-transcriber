@@ -46,6 +46,12 @@ REDACTED = "***"
 # shorten it.
 HEARTBEAT_S = 60.0
 HEARTBEAT_THREAD_NAME = "status-heartbeat"
+RUNNER_LOCK_FILE = ".runner.lock"
+
+
+class RunnerAlreadyRunningError(RuntimeError):
+    """Another runner holds this job folder's lock; this one did nothing."""
+
 
 PERCENT_PREPARING = 5
 PERCENT_TRANSCRIBE_START = 10
@@ -330,6 +336,9 @@ def run_job(
     the exception is re-raised so the caller can map it to an exit code.
     """
     job = Path(job_dir)
+    release = _hold_runner_lock(job)
+    if release is None:  # raised before any status write: the first runner owns status.json
+        raise RunnerAlreadyRunningError("Another runner is already working on this job")
     reporter = _StatusReporter(job / STATUS_FILE)
     try:
         with _Heartbeat(reporter):
@@ -345,6 +354,31 @@ def run_job(
         except OSError as write_error:
             logger.error("Could not write the failed status: %s", type(write_error).__name__)
         raise
+    finally:
+        release()
+
+
+def _hold_runner_lock(job: Path) -> Callable[[], None] | None:
+    """Lock the job folder for this process; returns the release, or None if already locked.
+
+    If the app re-attaches after a crash between launching the runner and its first status
+    write, it launches again; the second runner then finds the lock and exits without touching
+    anything. The lock is an ``flock`` on ``<job>/.runner.lock``, dropped by the kernel when the
+    holder exits or dies. Where ``fcntl`` does not exist (Windows, where the tests run) there is
+    nothing to lock against.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        return lambda: None
+    job.mkdir(parents=True, exist_ok=True)
+    handle = open(job / RUNNER_LOCK_FILE, "a", encoding="utf-8")  # noqa: SIM115 (held for the run)
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle.close
 
 
 def main(argv: list[str] | None = None) -> int:
