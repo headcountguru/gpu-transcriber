@@ -1,9 +1,9 @@
 """Download and keep up to date the standalone ``yt-dlp.exe`` used for YouTube links."""
 
+import http.client
 import json
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -21,6 +21,7 @@ UPDATE_INTERVAL_S = 24 * 3600.0
 UPDATE_TIMEOUT_S = 180.0
 DOWNLOAD_TIMEOUT_S = 60.0
 DOWNLOAD_CHUNK_BYTES = 1 << 20
+EXE_MAGIC = b"MZ"  # every Windows program starts with these two bytes
 
 
 class YtDlpError(RuntimeError):
@@ -37,8 +38,21 @@ def no_window_kwargs() -> dict[str, Any]:
 def download_file(url: str, dest: Path) -> None:
     """Fetch ``url`` (always an https link chosen by this module) into ``dest``."""
     with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_S) as response:  # noqa: S310
+        announced = response.headers.get("Content-Length")
+        written = 0
         with dest.open("wb") as out:
-            shutil.copyfileobj(response, out, DOWNLOAD_CHUNK_BYTES)
+            while chunk := response.read(DOWNLOAD_CHUNK_BYTES):
+                out.write(chunk)
+                written += len(chunk)
+    if announced is not None and announced.isdigit() and written != int(announced):
+        raise OSError(f"the download stopped early ({written} of {announced} bytes)")
+
+
+def _looks_like_an_exe(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    with path.open("rb") as handle:
+        return handle.read(len(EXE_MAGIC)) == EXE_MAGIC
 
 
 def ensure_ytdlp(app_dir: Path, download: Callable[[str, Path], None] = download_file) -> Path:
@@ -50,10 +64,10 @@ def ensure_ytdlp(app_dir: Path, download: Callable[[str, Path], None] = download
     part = exe.with_name(exe.name + ".part")
     try:
         download(YTDLP_URL, part)
-        if not part.is_file() or part.stat().st_size == 0:
-            raise OSError("the download was empty")
+        if not _looks_like_an_exe(part):
+            raise OSError("the download is not a Windows program")
         os.replace(part, exe)
-    except OSError as exc:
+    except (OSError, http.client.HTTPException) as exc:
         logger.warning("yt-dlp download failed: %s", exc)
         part.unlink(missing_ok=True)
         raise YtDlpError(

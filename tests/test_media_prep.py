@@ -10,6 +10,7 @@ import imageio_ffmpeg
 import pytest
 
 from app.media_prep import (
+    DOWNLOAD_TIMEOUT_S,
     MediaPrepError,
     PreparedAudio,
     compress_args,
@@ -54,23 +55,27 @@ class FakeYtDlp:
     def __init__(
         self,
         ytdlp_exe: Path,
-        results: list["subprocess.CompletedProcess[str]"],
+        results: list["subprocess.CompletedProcess[str] | Exception"],
         write_wav_to: Path | None = None,
     ) -> None:
         self.ytdlp_exe = str(ytdlp_exe)
         self.results = list(results)
         self.write_wav_to = write_wav_to
         self.ytdlp_calls: list[list[str]] = []
+        self.ytdlp_kwargs: list[dict[str, object]] = []
 
     def __call__(self, args: list[str], **kwargs: object) -> "subprocess.CompletedProcess[str]":
         command = [str(a) for a in args]
         if command[0] != self.ytdlp_exe:
             return subprocess.run(args, **kwargs)  # type: ignore[call-overload]
         self.ytdlp_calls.append(command)
+        self.ytdlp_kwargs.append(kwargs)
         if "-U" in command:
             return subprocess.CompletedProcess(args, 0, "", "")
         result = self.results.pop(0)
-        if result.returncode == 0 and self.write_wav_to is not None:
+        if isinstance(result, Exception):
+            raise result
+        if result.returncode in (0, 101) and self.write_wav_to is not None:
             make_wav(self.write_wav_to)
         return result
 
@@ -393,3 +398,186 @@ def test_safe_folder_name_cap_does_not_leave_trailing_space() -> None:
 
 def test_safe_folder_name_keeps_ordinary_titles() -> None:
     assert safe_folder_name("Weekly meeting - 2026") == "Weekly meeting - 2026"
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://www.youtube.com/watch?v=abc123",
+        "https://youtube.com/watch?v=abc123&t=30s",
+        "https://m.youtube.com/watch?v=abc123",
+        "https://music.youtube.com/watch?v=abc123",
+        "https://youtu.be/abc123",
+        "https://youtu.be/abc123?list=PL1",
+        "https://www.youtube.com/shorts/abc123",
+        "https://www.youtube.com/live/abc123",
+        "https://www.youtube.com/embed/abc123",
+        "https://www.youtube.com/embed/abc123?list=PL1",
+    ],
+)
+def test_probe_accepts_single_video_link_shapes(link: str, ytdlp_exe: Path) -> None:
+    run = FakeYtDlp(ytdlp_exe, [completed(0, "60\n")])
+
+    assert probe_duration_s(link, True, FFMPEG, ytdlp_exe, run=run) == 60.0
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://www.youtube.com/@somechannel",
+        "https://www.youtube.com/@somechannel/videos",
+        "https://www.youtube.com/channel/UC123",
+        "https://www.youtube.com/user/someone",
+        "https://www.youtube.com/c/somename",
+        "https://www.youtube.com/",
+        "https://www.youtube.com/watch",
+        "https://www.youtube.com/watch?v=",
+        "https://www.youtube.com/shorts/",
+        "https://youtu.be/",
+        "https://notyoutu.be/abc123",
+        "https://www.youtube.com.evil.example/watch?v=abc123",
+        "https://example.com/watch?v=abc123",
+        "http://[bad",
+    ],
+)
+def test_prepare_youtube_rejects_links_that_are_not_a_single_video(
+    link: str, tmp_path: Path, ytdlp_exe: Path
+) -> None:
+    run = FakeYtDlp(ytdlp_exe, [])
+
+    with pytest.raises(MediaPrepError) as caught:
+        prepare_youtube(link, tmp_path, FFMPEG, ytdlp_exe, run=run)
+
+    message = str(caught.value)
+    assert "single video" in message.lower()
+    assert "Traceback" not in message
+    assert run.ytdlp_calls == []
+
+
+def test_probe_rejects_links_that_are_not_a_single_video(tmp_path: Path, ytdlp_exe: Path) -> None:
+    run = FakeYtDlp(ytdlp_exe, [])
+
+    with pytest.raises(MediaPrepError) as caught:
+        probe_duration_s("https://www.youtube.com/@somechannel", True, FFMPEG, ytdlp_exe, run=run)
+
+    assert "single video" in str(caught.value).lower()
+    assert run.ytdlp_calls == []
+
+
+def test_prepare_youtube_refuses_live_streams_and_stops_after_one_download(
+    tmp_path: Path, ytdlp_exe: Path
+) -> None:
+    work = tmp_path / "work"
+    downloaded = work / "download.wav"
+    run = FakeYtDlp(ytdlp_exe, [completed(0, f"T\n{downloaded}\n")], write_wav_to=downloaded)
+
+    prepare_youtube(VIDEO_URL, work, FFMPEG, ytdlp_exe, run=run)
+
+    command = run.ytdlp_calls[0]
+    assert command[command.index("--match-filter") + 1] == "!is_live"
+    assert command[command.index("--max-downloads") + 1] == "1"
+
+
+def test_prepare_youtube_says_live_stream_when_the_filter_skips_the_video(
+    tmp_path: Path, ytdlp_exe: Path
+) -> None:
+    run = FakeYtDlp(ytdlp_exe, [completed(0, "", "")])
+
+    with pytest.raises(MediaPrepError) as caught:
+        prepare_youtube(VIDEO_URL, tmp_path / "work", FFMPEG, ytdlp_exe, run=run)
+
+    assert "live stream" in str(caught.value).lower()
+    assert "empty" not in str(caught.value).lower()
+    assert run.ytdlp_calls[1:] == []
+
+
+def test_prepare_youtube_treats_max_downloads_exit_code_as_success(
+    tmp_path: Path, ytdlp_exe: Path
+) -> None:
+    work = tmp_path / "work"
+    downloaded = work / "download.wav"
+    run = FakeYtDlp(ytdlp_exe, [completed(101, f"T\n{downloaded}\n")], write_wav_to=downloaded)
+
+    prepared = prepare_youtube(VIDEO_URL, work, FFMPEG, ytdlp_exe, run=run)
+
+    assert prepared.title == "T"
+    assert all("-U" not in call for call in run.ytdlp_calls)
+
+
+def test_prepare_youtube_download_has_a_generous_finite_timeout(
+    tmp_path: Path, ytdlp_exe: Path
+) -> None:
+    work = tmp_path / "work"
+    downloaded = work / "download.wav"
+    run = FakeYtDlp(ytdlp_exe, [completed(0, f"T\n{downloaded}\n")], write_wav_to=downloaded)
+
+    prepare_youtube(VIDEO_URL, work, FFMPEG, ytdlp_exe, run=run)
+
+    assert run.ytdlp_kwargs[0]["timeout"] == DOWNLOAD_TIMEOUT_S
+    assert 3600 <= DOWNLOAD_TIMEOUT_S <= 24 * 3600
+
+
+def test_prepare_youtube_turns_a_timeout_into_a_plain_error(
+    tmp_path: Path, ytdlp_exe: Path
+) -> None:
+    run = FakeYtDlp(ytdlp_exe, [subprocess.TimeoutExpired(["yt-dlp"], DOWNLOAD_TIMEOUT_S)])
+
+    with pytest.raises(MediaPrepError) as caught:
+        prepare_youtube(VIDEO_URL, tmp_path / "work", FFMPEG, ytdlp_exe, run=run)
+
+    message = str(caught.value)
+    assert "too long" in message.lower()
+    assert "TimeoutExpired" not in message
+
+
+def test_prepare_youtube_runs_yt_dlp_with_utf8_output(tmp_path: Path, ytdlp_exe: Path) -> None:
+    work = tmp_path / "work"
+    downloaded = work / "download.wav"
+    run = FakeYtDlp(ytdlp_exe, [completed(0, f"T\n{downloaded}\n")], write_wav_to=downloaded)
+
+    prepare_youtube(VIDEO_URL, work, FFMPEG, ytdlp_exe, run=run)
+
+    env = run.ytdlp_kwargs[0]["env"]
+    assert isinstance(env, dict)
+    assert env["PYTHONUTF8"] == "1"
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert run.ytdlp_kwargs[0]["encoding"] == "utf-8"
+
+
+def test_prepare_youtube_finds_the_file_when_the_printed_path_is_garbled(
+    tmp_path: Path, ytdlp_exe: Path
+) -> None:
+    work = tmp_path / "José" / "work"
+    downloaded = work / "download.wav"
+    garbled = str(downloaded).replace("é", "��")
+    run = FakeYtDlp(ytdlp_exe, [completed(0, f"Título\n{garbled}\n")], write_wav_to=downloaded)
+
+    prepared = prepare_youtube(VIDEO_URL, work, FFMPEG, ytdlp_exe, run=run)
+
+    assert prepared.title == "Título"
+    assert prepared.duration_s == pytest.approx(2.0, abs=0.2)
+
+
+def test_prepare_youtube_clears_stale_downloads_and_ignores_partial_files(
+    tmp_path: Path, ytdlp_exe: Path
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    stale = work / "download.m4a"
+    stale.write_bytes(b"old junk from an earlier run")
+    downloaded = work / "download.wav"
+    seen: list[bool] = []
+
+    class Checking(FakeYtDlp):
+        def __call__(self, args, **kwargs):  # type: ignore[no-untyped-def]
+            if str(args[0]) == self.ytdlp_exe and "-U" not in args:
+                seen.append(stale.exists())
+                (work / "download.wav.part").write_bytes(b"half")
+            return super().__call__(args, **kwargs)
+
+    run = Checking(ytdlp_exe, [completed(0, f"T\n{downloaded}\n")], write_wav_to=downloaded)
+
+    prepared = prepare_youtube(VIDEO_URL, work, FFMPEG, ytdlp_exe, run=run)
+
+    assert seen == [False]
+    assert prepared.duration_s == pytest.approx(2.0, abs=0.2)

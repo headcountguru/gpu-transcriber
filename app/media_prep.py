@@ -5,13 +5,14 @@ no tool output). The orchestrator relies on that exception to stop before anythi
 """
 
 import logging
+import os
 import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import ParseResult, parse_qs, urlparse
 
 from app.ytdlp_tool import no_window_kwargs, update_ytdlp
 
@@ -25,6 +26,7 @@ MAX_FOLDER_NAME_CHARS = 80
 UNTITLED = "untitled"
 FFMPEG_PROBE_TIMEOUT_S = 60.0
 YTDLP_PROBE_TIMEOUT_S = 90.0
+DOWNLOAD_TIMEOUT_S = 6 * 3600.0  # a very long video on a slow link; finite so nothing hangs forever
 RESERVED_NAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
     | {f"COM{n}" for n in range(1, 10)}
@@ -34,6 +36,11 @@ RESERVED_NAMES = frozenset(
 _ILLEGAL_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 _DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
 _YOUTUBE_SHORT_HOST = "youtu.be"
+_YOUTUBE_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"})
+_VIDEO_PATH_KINDS = frozenset({"shorts", "live", "embed"})
+_PARTIAL_SUFFIXES = frozenset({".part", ".ytdl", ".temp"})
+MAX_DOWNLOADS_REACHED = 101  # yt-dlp's exit code once --max-downloads is satisfied
+_DOWNLOAD_OK_CODES = frozenset({0, MAX_DOWNLOADS_REACHED})
 
 MSG_NO_AUDIO = "This file has no audio to transcribe."
 MSG_UNREADABLE = "Can't read this file. It may be damaged or not an audio or video file."
@@ -42,6 +49,10 @@ MSG_MISSING = "Can't find that file. It may have been moved or deleted."
 MSG_CONVERT_FAILED = "Could not convert this file to audio."
 MSG_PLAYLIST = "Playlists are not supported. Paste the link to a single video instead."
 MSG_NOT_A_LINK = "That doesn't look like a web link. Paste the full link to a YouTube video."
+MSG_NOT_SINGLE_VIDEO = (
+    "That link isn't a single video from YouTube. Paste the link to one video "
+    "(not a channel, a playlist or another website)."
+)
 MSG_UNAVAILABLE = (
     "That video is unavailable. It may be private, removed, or not offered in your country."
 )
@@ -142,9 +153,13 @@ def _classify(text: str, table: tuple[tuple[tuple[str, ...], str], ...], default
 
 
 def _run_tool(
-    run: Run, command: list[str], timeout: float | None
+    run: Run,
+    command: list[str],
+    timeout: float | None,
+    env: dict[str, str] | None = None,
 ) -> "subprocess.CompletedProcess[str]":
     """Run a command with captured text output and no console window."""
+    extra: dict[str, Any] = {} if env is None else {"env": env}
     try:
         return run(
             command,
@@ -155,6 +170,7 @@ def _run_tool(
             check=False,
             timeout=timeout,
             **no_window_kwargs(),
+            **extra,
         )
     except subprocess.TimeoutExpired as exc:
         logger.warning("%s timed out", Path(command[0]).name)
@@ -226,18 +242,32 @@ def prepare_file(
     return _compress(source, work_dir, ffmpeg_exe, source.stem, run)
 
 
+def _is_single_video(parsed: ParseResult, host: str) -> bool:
+    """True for watch?v=, youtu.be/<id>, shorts/, live/ and embed/ links on real YouTube hosts."""
+    parts = [part for part in parsed.path.split("/") if part]
+    if host == _YOUTUBE_SHORT_HOST:
+        return len(parts) == 1
+    if host not in _YOUTUBE_HOSTS:
+        return False
+    if parts == ["watch"]:
+        return bool(parse_qs(parsed.query).get("v"))
+    return len(parts) == 2 and parts[0] in _VIDEO_PATH_KINDS
+
+
 def _check_youtube_url(url: str) -> str:
     text = url.strip()
-    parsed = urlparse(text)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    try:
+        parsed = urlparse(text)
+        host = (parsed.hostname or "").lower()
+    except ValueError as exc:
+        raise MediaPrepError(MSG_NOT_SINGLE_VIDEO) from exc
+    if parsed.scheme not in ("http", "https") or not host:
         raise MediaPrepError(MSG_NOT_A_LINK)
-    query = parse_qs(parsed.query)
-    is_short_video_link = parsed.netloc.lower().endswith(_YOUTUBE_SHORT_HOST) and bool(
-        parsed.path.strip("/")
-    )
-    if "list" in query and "v" not in query and not is_short_video_link:
+    if _is_single_video(parsed, host):
+        return text
+    if (host in _YOUTUBE_HOSTS or host == _YOUTUBE_SHORT_HOST) and "list" in parse_qs(parsed.query):
         raise MediaPrepError(MSG_PLAYLIST)
-    return text
+    raise MediaPrepError(MSG_NOT_SINGLE_VIDEO)
 
 
 def _ytdlp_base(ytdlp_exe: Path, ffmpeg_exe: str, cookies_file: Path | None) -> list[str]:
@@ -247,16 +277,46 @@ def _ytdlp_base(ytdlp_exe: Path, ffmpeg_exe: str, cookies_file: Path | None) -> 
     return command
 
 
-def _run_ytdlp(command: list[str], ytdlp_exe: Path, timeout: float | None, run: Run) -> str:
+def _ytdlp_env() -> dict[str, str]:
+    """The environment for yt-dlp, forcing UTF-8 on its piped output."""
+    return {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+
+
+def _run_ytdlp(
+    command: list[str],
+    ytdlp_exe: Path,
+    timeout: float | None,
+    run: Run,
+    ok_codes: frozenset[int] = frozenset({0}),
+) -> str:
     """Run yt-dlp, updating it once and retrying once if it fails; return its stdout."""
-    result = _run_tool(run, command, timeout)
-    if result.returncode != 0 and update_ytdlp(ytdlp_exe, run=run):
+    result = _run_tool(run, command, timeout, _ytdlp_env())
+    if result.returncode not in ok_codes and update_ytdlp(ytdlp_exe, run=run):
         logger.info("yt-dlp failed; retrying after an update")
-        result = _run_tool(run, command, timeout)
-    if result.returncode != 0:
+        result = _run_tool(run, command, timeout, _ytdlp_env())
+    if result.returncode not in ok_codes:
         logger.warning("yt-dlp failed (exit %s)", result.returncode)
         raise MediaPrepError(_classify(result.stderr or "", _YTDLP_PROBLEMS, MSG_DOWNLOAD_FAILED))
     return result.stdout or ""
+
+
+def _download_files(work_dir: Path) -> list[Path]:
+    return [p for p in work_dir.glob("download.*") if p.is_file()]
+
+
+def _clear_downloads(work_dir: Path) -> None:
+    """Delete every ``download.*`` file (stale or leftover) from ``work_dir``."""
+    for path in _download_files(work_dir):
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.warning("Could not remove %s: %s", path.name, exc)
+
+
+def _find_download(work_dir: Path) -> Path | None:
+    """The newest finished ``download.*`` file (``.part``/``.ytdl`` leftovers are skipped)."""
+    finished = [p for p in _download_files(work_dir) if p.suffix.lower() not in _PARTIAL_SUFFIXES]
+    return max(finished, key=lambda p: p.stat().st_mtime, default=None)
 
 
 def prepare_youtube(
@@ -271,24 +331,27 @@ def prepare_youtube(
     """Download a YouTube video's audio and compress it to ``work_dir/audio.opus``."""
     link = _check_youtube_url(url)
     work_dir.mkdir(parents=True, exist_ok=True)
+    _clear_downloads(work_dir)
     command = _ytdlp_base(ytdlp_exe, ffmpeg_exe, cookies_file) + [
-        "-f", "bestaudio", "--no-simulate",
+        "-f", "bestaudio", "--no-simulate", "--match-filter", "!is_live", "--max-downloads", "1",
         "--print", "before_dl:%(title)s", "--print", "after_move:filepath",
         "-o", str(work_dir / DOWNLOAD_NAME), link,
     ]  # fmt: skip
-    lines = [line.strip() for line in _run_ytdlp(command, ytdlp_exe, None, run).splitlines()]
-    lines = [line for line in lines if line]
-    if len(lines) < 2:
-        raise MediaPrepError(MSG_DOWNLOAD_EMPTY)
-    title, downloaded = lines[0], Path(lines[-1])
+    output = _run_ytdlp(command, ytdlp_exe, DOWNLOAD_TIMEOUT_S, run, _DOWNLOAD_OK_CODES)
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    # The printed path is not trusted (piped output may be mangled for non-ASCII folders).
+    downloaded = _find_download(work_dir)
+    if downloaded is None:
+        raise MediaPrepError(MSG_DOWNLOAD_EMPTY if lines else MSG_LIVE)
     try:
         _check_source(downloaded)
     except MediaPrepError as exc:
         raise MediaPrepError(MSG_DOWNLOAD_EMPTY) from exc
+    title = lines[0] if len(lines) >= 2 else UNTITLED
     try:
         return _compress(downloaded, work_dir, ffmpeg_exe, title, run)
     finally:
-        downloaded.unlink(missing_ok=True)
+        _clear_downloads(work_dir)
 
 
 def probe_duration_s(

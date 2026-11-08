@@ -1,5 +1,7 @@
 """Tests for downloading and updating the standalone yt-dlp.exe."""
 
+import http.client
+import io
 import json
 import subprocess
 from pathlib import Path
@@ -58,9 +60,79 @@ def test_ensure_ytdlp_creates_missing_app_dir(tmp_path: Path) -> None:
     app_dir = tmp_path / "nested" / "bin"
 
     def download(url: str, dest: Path) -> None:
-        dest.write_bytes(b"x")
+        dest.write_bytes(b"MZx")
 
     assert ensure_ytdlp(app_dir, download).is_file()
+
+
+def test_ensure_ytdlp_rejects_a_download_that_is_not_an_exe(tmp_path: Path) -> None:
+    def download(url: str, dest: Path) -> None:
+        dest.write_bytes(b"<html>Rate limit exceeded</html>")
+
+    with pytest.raises(YtDlpError):
+        ensure_ytdlp(tmp_path, download)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_ensure_ytdlp_turns_http_client_errors_into_the_plain_error(tmp_path: Path) -> None:
+    def download(url: str, dest: Path) -> None:
+        dest.write_bytes(b"MZ-half")
+        raise http.client.IncompleteRead(b"MZ-half", 100)
+
+    with pytest.raises(YtDlpError) as caught:
+        ensure_ytdlp(tmp_path, download)
+
+    assert "internet" in str(caught.value).lower()
+    assert list(tmp_path.iterdir()) == []
+
+
+class FakeResponse(io.BytesIO):
+    """A urlopen() result: a readable body plus the headers the server sent."""
+
+    def __init__(self, body: bytes, content_length: int | None) -> None:
+        super().__init__(body)
+        self.headers = {} if content_length is None else {"Content-Length": str(content_length)}
+
+
+def test_download_file_rejects_a_body_shorter_than_content_length(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "app.ytdlp_tool.urllib.request.urlopen",
+        lambda url, timeout: FakeResponse(b"MZ" + b"a" * 8, content_length=100),
+    )
+
+    with pytest.raises(YtDlpError):
+        ensure_ytdlp(tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_file_installs_a_complete_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = b"MZ" + b"a" * 98
+    monkeypatch.setattr(
+        "app.ytdlp_tool.urllib.request.urlopen",
+        lambda url, timeout: FakeResponse(body, content_length=len(body)),
+    )
+
+    exe = ensure_ytdlp(tmp_path)
+
+    assert exe.read_bytes() == body
+    assert list(tmp_path.glob("*.part")) == []
+
+
+def test_download_file_accepts_a_response_without_content_length(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "app.ytdlp_tool.urllib.request.urlopen",
+        lambda url, timeout: FakeResponse(b"MZ-body", content_length=None),
+    )
+
+    assert ensure_ytdlp(tmp_path).read_bytes() == b"MZ-body"
 
 
 def test_ensure_ytdlp_failed_download_gives_plain_error_and_cleans_up(tmp_path: Path) -> None:
