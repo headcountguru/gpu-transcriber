@@ -183,7 +183,7 @@ class FakeSession:
 class FakeVast:
     def __init__(self, world: "World") -> None:
         self.world = world
-        self.offers = [OFFER]
+        self.offers = [dataclasses.replace(OFFER, id=i) for i in (7, 8, 9)]  # replacements differ
         self.balance = 100.0
         self.instances: dict[int, Instance] = {}
         self.next_id = 1000

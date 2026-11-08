@@ -37,6 +37,29 @@ RUNNER_PYTHONPATH = "/app:/app/remote"  # as in the image (see scripts/live_smok
 LOST_WHILE_CLOSED = "The machine was lost while the app was closed."
 CLOSED_BEFORE_RENTING = "The app was closed before this job rented a machine. Start it again."
 
+# Stall detection (see ``StallWatch``). The runner writes its first status.json within seconds of
+# starting, before its heavy imports (live: about 10 s from launch); 15 minutes also covers a very
+# slow disk. While running it rewrites the status at least every ``heartbeat_s`` (60 s), even in
+# one long step with no progress (a 30-minute diarization chunk, forced alignment), so 20 minutes
+# without any change is 20 missed heartbeats: the runner is dead, not slow. A runner that reports
+# ``heartbeat_s`` 0 (an image built before the heartbeat) is never judged stale, because its silent
+# steps have no known bound.
+NO_FIRST_STATUS_S = 15 * 60.0
+STALE_STATUS_S = 20 * 60.0
+STALE_MIN_HEARTBEATS = 10  # never stricter than this many missed heartbeats
+MSG_NEVER_REPORTED = (
+    "The machine stopped reporting progress: the transcription never started reporting on it "
+    "within {minutes:.0f} minutes, so the job was stopped. Finished parts are saved."
+)
+MSG_STOPPED_REPORTING = (
+    "The machine stopped reporting progress for {minutes:.0f} minutes, so the job was stopped. "
+    "Finished parts are saved."
+)
+MSG_NO_UNTRIED_OFFER = (
+    "The only suitable machines available right now are ones that already failed for this job, "
+    "so no other machine was rented. Finished parts are saved. Try again later."
+)
+
 # The only checkpoint names ever downloaded or uploaded (see remote/chunker.py and
 # remote/run_job.py). Anything else a machine lists, including names with path parts, is ignored.
 CHECKPOINT_NAME_RE = re.compile(r"diar_\d+\.json|words\.json")
@@ -124,6 +147,64 @@ def parse_status(text: str | None) -> RemoteStatus | None:
     if not isinstance(status.percent, int) or not isinstance(status.message, str):
         return None
     return status
+
+
+class TriedOffers:
+    """Offers, and the hosts behind them, already rented during one run of a job."""
+
+    def __init__(self) -> None:
+        self._offers: set[int] = set()
+        self._hosts: set[int] = set()
+
+    def remember(self, offer: Offer) -> None:
+        self._offers.add(offer.id)
+        if offer.machine_id is not None:
+            self._hosts.add(offer.machine_id)
+
+    def untried(self, offers: list[Offer]) -> list[Offer]:
+        """``offers`` (order kept) without any tried offer or any offer on a tried host."""
+        return [
+            item
+            for item in offers
+            if item.id not in self._offers
+            and (item.machine_id is None or item.machine_id not in self._hosts)
+        ]
+
+
+class StallWatch:
+    """Tells a dead runner from a slow one, using only the app's own (injected) clock.
+
+    The machine's ``updated_at`` is never compared with the PC's clock (they may disagree);
+    only *whether it changed* matters, timed locally from when the watch saw it change.
+    """
+
+    def __init__(self, clock: Callable[[], float]) -> None:
+        self._clock = clock
+        self._started = clock()
+        self._seen: tuple[object, ...] | None = None
+        self._changed_at = self._started
+        self._heartbeat_s = 0.0
+
+    def check(self, status: RemoteStatus | None) -> str | None:
+        """None while all is well, else the plain-words reason the runner looks dead."""
+        now = self._clock()
+        if status is not None:
+            seen = (status.state, status.stage, status.percent, status.message, status.chunk)
+            seen += (status.updated_at,)
+            if seen != self._seen:
+                self._seen, self._changed_at = seen, now
+                self._heartbeat_s = status.heartbeat_s if status.state == "running" else 0.0
+                return None
+        if self._seen is None:
+            if now - self._started >= NO_FIRST_STATUS_S:
+                return MSG_NEVER_REPORTED.format(minutes=NO_FIRST_STATUS_S / 60)
+            return None
+        if not isinstance(self._heartbeat_s, (int, float)) or self._heartbeat_s <= 0:
+            return None
+        limit = max(STALE_STATUS_S, STALE_MIN_HEARTBEATS * float(self._heartbeat_s))
+        if now - self._changed_at >= limit:
+            return MSG_STOPPED_REPORTING.format(minutes=limit / 60)
+        return None
 
 
 def is_checkpoint_name(name: str) -> bool:
@@ -321,11 +402,20 @@ def settled_job(job: Job, cost: float) -> Job:
     )
 
 
-def mark_lost(store: JobStore, job: Job) -> None:
-    """Fail an unfinished job whose machine is gone (or that never rented one)."""
+def mark_lost(store: JobStore, job: Job, destroyed: bool = True) -> None:
+    """Fail an unfinished job whose machine is gone (or that never rented one).
+
+    ``destroyed=False`` means its saved machine could not be confirmed destroyed: the id and
+    start time are kept (the "may still be running" alarm) so ``retry_unconfirmed_destroys``
+    keeps trying, and the message says so.
+    """
     never_rented = job.instance_id is None and job.machine_started_at is None
     message = CLOSED_BEFORE_RENTING if never_rented else LOST_WHILE_CLOSED
     cost = max(job.banked_cost, job.cost_so_far)
+    if not destroyed and job.instance_id is not None:
+        warned = f"{message} {still_running_text(job.instance_id)}"
+        store.save(job.with_(state=JobState.FAILED, message=warned, error=warned))
+        return
     store.save(
         job.with_(
             state=JobState.FAILED,

@@ -10,6 +10,8 @@ Billing safety, in order of importance:
   - A create with an unclear outcome is followed by a bounded search for the job's label, and
     anything found is destroyed. A definite refusal skips the search.
   - The spending cap is a hard limit, checked at every wait, upload callback and poll.
+  - A runner that never reports, or whose heartbeat stops, fails the job (``StallWatch``)
+    instead of billing up to the cap. A replacement never reuses a failed offer or host.
   - The machine's start-up script runs the on-machine watchdog, so a machine whose app died
     still destroys itself.
   - The same job is never run twice at once (a second ``run`` raises ``JobAlreadyRunningError``),
@@ -44,6 +46,9 @@ from app.jobs import TERMINAL_STATES, Job, JobState, JobStore, state_for_stage
 from app.media_prep import UNTITLED, MediaPrepError, PreparedAudio, safe_folder_name
 from app.orchestrator_support import (
     LINK_ERRORS,
+    MSG_NO_UNTRIED_OFFER,
+    StallWatch,
+    TriedOffers,
     VastLike,
     belongs_to_unfinished_job,
     build_onstart,
@@ -73,6 +78,7 @@ from common.protocol import (
     STATUS_FILE,
     RemoteStatus,
     max_runtime_s,
+    shorten_remote_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -134,6 +140,11 @@ class _JobRun:
         self.on_update = on_update
         self.cancel = cancel
         self.secrets: list[str] = []
+        self.tried = TriedOffers()  # never rent a failed offer or host again in this run
+
+    def remote_text(self, text: str) -> str:
+        """Text from the machine, scrubbed first and then shortened (see shorten_remote_text)."""
+        return shorten_remote_text(scrub(text, self.secrets))
 
     def save(self, **changes: object) -> Job:
         for key in ("message", "error"):
@@ -259,28 +270,37 @@ class Orchestrator:
         """At app start: re-attach unfinished jobs to their machines, found by label.
 
         Returns the ids of re-attached jobs (call ``run`` for each). A job whose machine is not
-        found is marked FAILED. Unreadable job files are skipped. A failed listing raises
-        ``VastError`` and changes nothing.
+        found is marked FAILED, after its saved machine (if any) is destroyed: the listing can
+        miss a machine (no label yet, a lagging list). Jobs being run are never touched.
+        Unreadable job files are skipped. A failed listing raises ``VastError`` and changes
+        nothing.
         """
-        pending = [job for job in self._store.load_all() if job.state not in TERMINAL_STATES]
+        pending = [
+            job
+            for job in self._store.load_all()
+            if job.state not in TERMINAL_STATES and not self._is_running(job.id)
+        ]
         if not pending:
             return []
         listed = self._vast.list_instances(self._settings.label_prefix)
         resumed: list[str] = []
         for job in pending:
+            if self._is_running(job.id):  # claimed by run() while we were listing
+                continue
             found = [item for item in listed if item.label == self._label(job.id)]
             if found:
                 reattach(self._store, job, found, self._clock, self._destroy)
                 resumed.append(job.id)
-            else:
-                mark_lost(self._store, job)
+                continue
+            destroyed = job.instance_id is None or self._destroy(job.instance_id)
+            mark_lost(self._store, job, destroyed=destroyed)
         return resumed
 
     def reap_orphans(self) -> list[int]:
         """Destroy labelled machines whose job is finished or unknown. Returns the ids destroyed.
 
-        A machine belonging to an unfinished job is never touched, nor is one without the
-        app's label prefix. Jobs with an unconfirmed destroy are settled first.
+        A machine belonging to an unfinished or running job is never touched, nor is one
+        without the app's label prefix. Jobs with an unconfirmed destroy are settled first.
         """
         self.retry_unconfirmed_destroys()
         prefix = self._settings.label_prefix
@@ -288,7 +308,8 @@ class Orchestrator:
         for instance in self._vast.list_instances(prefix):
             if not instance.label or not instance.label.startswith(prefix):
                 continue
-            if belongs_to_unfinished_job(self._store, instance.label[len(prefix) :]):
+            job_id = instance.label[len(prefix) :]
+            if self._is_running(job_id) or belongs_to_unfinished_job(self._store, job_id):
                 continue
             logger.warning("Destroying orphaned machine %s (%s)", instance.id, instance.label)
             if self._destroy(instance.id):
@@ -308,16 +329,28 @@ class Orchestrator:
         for job in self._store.load_all():
             if job.state not in TERMINAL_STATES or job.instance_id is None:
                 continue
-            with self._running_lock:
-                if job.id in self._running:
-                    continue
-            if not self._destroy(job.instance_id):
+            if self._is_running(job.id):
                 continue
-            updated = settled_job(job, self._cost(job))
+            instance_id = job.instance_id
+            if not self._destroy(instance_id):
+                continue
+            # The destroy can take a while: the job may have changed meanwhile (cap raised, a
+            # run started), so settle the newest copy, and only if it still has this machine.
+            try:
+                fresh = self._store.get(job.id)
+            except (FileNotFoundError, ValueError):
+                continue
+            if self._is_running(job.id) or fresh.instance_id != instance_id:
+                continue
+            updated = settled_job(fresh, self._cost(fresh))
             self._store.save(updated)
             settled.append(updated)
-            logger.info("Machine %s of job %s is now confirmed gone", job.instance_id, job.id)
+            logger.info("Machine %s of job %s is now confirmed gone", instance_id, job.id)
         return settled
+
+    def _is_running(self, job_id: str) -> bool:
+        with self._running_lock:
+            return job_id in self._running
 
     def raise_cap_and_continue(self, job_id: str, new_cap: float) -> Job:
         """Give a job stopped at its cap a higher cap; ``run`` then resumes from its checkpoints.
@@ -436,7 +469,10 @@ class Orchestrator:
             raise _JobFailed(f"Could not check Vast.ai, so nothing was rented. {exc}") from None
         if not offers:
             raise _JobFailed(MSG_NO_OFFER)
-        offer = offers[0]
+        untried = ctx.tried.untried(offers)
+        if not untried:
+            raise _JobFailed(MSG_NO_UNTRIED_OFFER)
+        offer = untried[0]
         job = ctx.job
         cap = job.cost_cap
         if cap <= 0:
@@ -458,6 +494,7 @@ class Orchestrator:
                 "Choose a higher cap and start the job again. Nothing was rented."
             )
         ctx.save(cost_cap=cap, price_per_hour=offer.dph_total)
+        ctx.tried.remember(offer)
         return offer
 
     def _rent(self, ctx: _JobRun, offer: Offer) -> None:
@@ -596,11 +633,12 @@ class Orchestrator:
     def _poll(self, ctx: _JobRun, session: RemoteSession) -> None:
         """Poll until the outputs are downloaded. Raises for cap, cancel, failure, loss."""
         unreachable = 0
+        watch = StallWatch(self._clock)
         while True:
             self._guard(ctx)
             ctx.save(cost_so_far=self._cost(ctx.job))
             try:
-                if self._poll_once(ctx, session):
+                if self._poll_once(ctx, session, watch):
                     return
                 unreachable = 0
             except LINK_ERRORS as exc:
@@ -613,10 +651,19 @@ class Orchestrator:
                     ) from None
             self._sleep(self._poll_interval_s)
 
-    def _poll_once(self, ctx: _JobRun, session: RemoteSession) -> bool:
-        """One status read. True once the job is done and its outputs are on the PC."""
+    def _poll_once(self, ctx: _JobRun, session: RemoteSession, watch: StallWatch) -> bool:
+        """One status read. True once the job is done and its outputs are on the PC.
+
+        A runner that never reports, or whose status stops changing, fails the job (after its
+        finished parts are saved) instead of letting the machine bill up to the cap.
+        """
         remote_dir = self._settings.remote_job_dir
         status = parse_status(session.read_text(f"{remote_dir}/{STATUS_FILE}"))
+        stalled = watch.check(status)
+        if stalled is not None:
+            logger.warning("Job %s: the runner on the machine looks dead", ctx.job.id)
+            self._try_pull_checkpoints(ctx, session)
+            raise _JobFailed(stalled)
         if status is None:
             return False
         job_dir = self._store.job_dir(ctx.job.id)
@@ -624,7 +671,7 @@ class Orchestrator:
             session, f"{remote_dir}/{JOB_CHECKPOINT_DIR}", job_dir / LOCAL_CHECKPOINT_DIR
         )
         if status.state == "failed":
-            reason = status.error or "no reason was given"
+            reason = ctx.remote_text(status.error or "") or "no reason was given"
             raise _JobFailed(f"The transcription failed on the machine: {reason}")
         if status.state == "done":
             self._collect_outputs(ctx, session)
@@ -640,7 +687,7 @@ class Orchestrator:
         ctx.save(
             state=state,
             percent=max(0, min(100, status.percent)),
-            message=status.message,
+            message=ctx.remote_text(status.message),
             chunk=status.chunk if _is_int(status.chunk) else None,
             chunks=status.chunks if _is_int(status.chunks) else None,
         )
