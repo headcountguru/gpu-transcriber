@@ -429,6 +429,7 @@ def test_refused_key_message_names_the_http_code_and_the_permissions_possibility
     message = str(err.value)
     assert f"HTTP {status}" in message
     assert "permission" in message
+    assert "no access ***" in message  # Vast.ai's own reason is shown, with the key hidden
     assert API_KEY not in message
     assert err.value.status_code == status
 

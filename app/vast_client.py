@@ -391,8 +391,8 @@ class VastClient:
             message = (
                 f"Could not {what}: Vast.ai refused the API key (HTTP {status}). The key may be "
                 "wrong or deleted, or it may not have permission for this step. Check the key and "
-                "its permissions in your Vast.ai account."
-            )
+                f"its permissions in your Vast.ai account. {self._excerpt(response)}"
+            ).strip()
         elif status == 429:
             message = (
                 f"Could not {what}: too many requests were sent to Vast.ai. Try again shortly."
