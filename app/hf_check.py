@@ -1,7 +1,15 @@
 """Check a Hugging Face token and its access to the two gated pyannote models.
 
-Mirrors cell 3b of the Kaggle notebook: ``GET /api/whoami-v2`` for the token and user name, then
-``GET /api/models/<model>`` for each gated model, where a 200 means the user accepted the terms.
+``GET /api/whoami-v2`` gives the token's validity and user name. Model access is probed with
+``HEAD https://huggingface.co/<model>/resolve/main/config.yaml`` (a gated file) using the token,
+without following redirects: 200 or a 3xx redirect to the CDN means the user accepted the terms,
+403 means they have not. Any other status (401 after a valid whoami, 404, 429, 5xx) is not a
+verdict and raises :class:`HfCheckError`.
+
+History: the Kaggle notebook's cell 3b used ``GET /api/models/<model>`` and treated 200 as
+"access granted". That endpoint returns public metadata (200) for these models even to callers
+without a token, so it can never say whether the terms were accepted; do not use it.
+
 The token is sent only in the ``Authorization`` header; it is never put in a URL, a log line, an
 exception message or the returned :class:`HfAccess`.
 """
@@ -13,14 +21,15 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-HF_API = "https://huggingface.co/api"
+HF_SITE = "https://huggingface.co"
+HF_API = f"{HF_SITE}/api"
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
 SEGMENTATION_MODEL = "pyannote/segmentation-3.0"
 GATED_MODELS = (DIARIZATION_MODEL, SEGMENTATION_MODEL)
+GATED_PROBE_FILE = "config.yaml"
 REQUEST_TIMEOUT_S = 15.0
 
-# Statuses that mean "this token is not allowed to see this model" (terms not accepted).
-_DENIED_STATUSES = (401, 403, 404)
+_TERMS_NOT_ACCEPTED_STATUS = 403
 
 
 class HfCheckError(RuntimeError):
@@ -39,13 +48,13 @@ class HfAccess:
 def check_hf_access(token: str, session: requests.Session | None = None) -> HfAccess:
     """Validate ``token`` and report access to each gated model.
 
-    An invalid token returns ``valid=False`` without calling the model endpoints. Network
-    failures and unexpected server replies raise :class:`HfCheckError`.
+    An invalid token returns ``valid=False`` without probing the models. Network failures and
+    unexpected server replies raise :class:`HfCheckError`.
     """
     http = session if session is not None else requests.Session()
     headers = {"Authorization": f"Bearer {token}"}
 
-    whoami = _get(http, f"{HF_API}/whoami-v2", headers)
+    whoami = _send(http, "GET", f"{HF_API}/whoami-v2", headers)
     if whoami.status_code == 401:
         return HfAccess(valid=False, user=None, models=dict.fromkeys(GATED_MODELS, False))
     if whoami.status_code != 200:
@@ -54,19 +63,26 @@ def check_hf_access(token: str, session: requests.Session | None = None) -> HfAc
 
     models: dict[str, bool] = {}
     for model in GATED_MODELS:
-        reply = _get(http, f"{HF_API}/models/{model}", headers)
-        if reply.status_code == 200:
+        url = f"{HF_SITE}/{model}/resolve/main/{GATED_PROBE_FILE}"
+        status = _send(http, "HEAD", url, headers).status_code
+        if status == 200 or 300 <= status < 400:
             models[model] = True
-        elif reply.status_code in _DENIED_STATUSES:
+        elif status == _TERMS_NOT_ACCEPTED_STATUS:
             models[model] = False
         else:
-            raise _unexpected(reply.status_code)
+            raise _unexpected(status)
     return HfAccess(valid=True, user=user, models=models)
 
 
-def _get(http: requests.Session, url: str, headers: dict[str, str]) -> requests.Response:
+def _send(
+    http: requests.Session, method: str, url: str, headers: dict[str, str]
+) -> requests.Response:
+    # Redirects are never followed: a 3xx to the CDN already answers the question, and following
+    # it would download the file.
     try:
-        return http.get(url, headers=headers, timeout=REQUEST_TIMEOUT_S)
+        return http.request(
+            method, url, headers=headers, timeout=REQUEST_TIMEOUT_S, allow_redirects=False
+        )
     except requests.RequestException as exc:
         # Log only the type: the message could echo request details.
         logger.warning("Hugging Face check failed (%s)", type(exc).__name__)
