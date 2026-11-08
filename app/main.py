@@ -9,7 +9,6 @@ import logging
 import os
 import sys
 import threading
-import time
 from collections.abc import Callable, Sequence
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -24,7 +23,7 @@ from app.media_prep import (
     prepare_youtube,
     probe_duration_s,
 )
-from app.remote_session import RemoteSession, SshRemoteSession, ensure_ssh_key
+from app.remote_session import RemoteSession, SshRemoteSession, check_private_key, ensure_ssh_key
 from app.settings import IMAGE, Settings, app_data_dir
 from app.vast_client import Instance, VastClient
 from app.ytdlp_tool import YtDlpError, ensure_ytdlp
@@ -114,23 +113,26 @@ def make_probe(ffmpeg: FfmpegPath, ytdlp: YtdlpPath) -> Callable[[str, bool], fl
     return probe
 
 
-def make_session_factory(key_path: Path) -> Callable[[Instance], RemoteSession]:
-    """``session_factory(instance)``: an SSH session to a running machine.
+def make_session_factory(
+    key_path: Path,
+) -> Callable[[Instance, Callable[[float], None]], RemoteSession]:
+    """``session_factory(instance, sleep)``: an SSH session to a running machine.
 
-    Known limit: the connect retries use plain ``time.sleep`` because the factory only sees the
-    instance, not the job, so it cannot check the job's spending cap. The cap can therefore be
-    overshot by up to ``SSH_CONNECT_TIMEOUT_S`` of rental (see the orchestrator's docstring).
+    ``sleep`` is the job's own wait between connect retries: it raises when the job is
+    cancelled or reaches its spending cap, which ends the retries at once. A missing or damaged
+    key file raises ``SshKeyError`` before any connect (retrying could never help).
     """
 
-    def factory(instance: Instance) -> RemoteSession:
+    def factory(instance: Instance, sleep: Callable[[float], None]) -> RemoteSession:
         if not instance.ssh_host or instance.ssh_port is None:
             raise ConnectionError("The machine has no SSH address yet.")
+        check_private_key(key_path)
         return SshRemoteSession.connect(
             instance.ssh_host,
             instance.ssh_port,
             str(key_path),
             timeout_s=SSH_CONNECT_TIMEOUT_S,
-            sleep=time.sleep,
+            sleep=sleep,
         )
 
     return factory

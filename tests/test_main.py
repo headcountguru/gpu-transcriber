@@ -8,6 +8,7 @@ from app import main as app_main
 from app.credentials import VAST_API_KEY, CredentialStore
 from app.jobs import JobStore
 from app.media_prep import MediaPrepError, PreparedAudio
+from app.remote_session import ensure_ssh_key
 from app.vast_client import Instance
 from app.ytdlp_tool import YtDlpError
 from tests.gui_fakes import FakeBackend, make_job
@@ -94,22 +95,25 @@ def test_session_factory_refuses_instance_without_address() -> None:
         id=1, status="running", ssh_host=None, ssh_port=None, dph_total=0.2, label="x"
     )
     with pytest.raises(ConnectionError):
-        factory(instance)
+        factory(instance, lambda _s: None)
 
 
-def test_session_factory_connects_with_the_app_key(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_session_factory_connects_with_the_app_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     seen: dict[str, object] = {}
+    key_path, _ = ensure_ssh_key(tmp_path)
 
     def fake_connect(host: str, port: int, key: str, **kwargs: object) -> str:
         seen.update(host=host, port=port, key=key, **kwargs)
         return "session"
 
     monkeypatch.setattr(app_main.SshRemoteSession, "connect", fake_connect)
-    factory = app_main.make_session_factory(Path("C:/data/id_ed25519"))
+    factory = app_main.make_session_factory(key_path)
     instance = Instance(id=1, status="running", ssh_host="h", ssh_port=22, dph_total=0.2, label="x")
-    assert factory(instance) == "session"
+    assert factory(instance, lambda _s: None) == "session"
     assert seen["host"] == "h" and seen["port"] == 22
-    assert seen["key"] == str(Path("C:/data/id_ed25519"))
+    assert seen["key"] == str(key_path)
     assert seen["timeout_s"] == app_main.SSH_CONNECT_TIMEOUT_S
 
 

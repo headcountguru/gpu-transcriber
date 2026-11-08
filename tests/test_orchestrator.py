@@ -281,7 +281,7 @@ class World:
             self.machines[instance_id] = machine
         return self.machines[instance_id]
 
-    def session_factory(self, instance: Instance) -> FakeSession:
+    def session_factory(self, instance: Instance, _sleep: object = None) -> FakeSession:
         self.connected.append(instance.id)
         return FakeSession(self.machine_for(instance.id))
 

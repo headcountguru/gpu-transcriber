@@ -23,9 +23,9 @@ cost keeps counting and its cap keeps being enforced. ``retry_unconfirmed_destro
 by ``reap_orphans``) settles such jobs once Vast.ai confirms the machine is gone.
 
 The cap can be overshot by a bounded amount: up to one poll interval, the time to download
-checkpoints and outputs, the destroy and its confirmation (up to about 100 s), the SSH connect
-retries inside ``session_factory`` (not interruptible from here), and the 180 s label sweep
-after an unclear create.
+checkpoints and outputs, the destroy and its confirmation (up to about 100 s), one SSH connect
+attempt (its retries wait through a sleep that checks cancel and cap), and the 180 s label
+sweep after an unclear create.
 
 Secrets: the Vast.ai key and Hugging Face token are scrubbed from every message and error saved
 on a job and from every log line written here. The token reaches the machine only through the
@@ -66,7 +66,7 @@ from app.orchestrator_support import (
     still_running_text,
     sweep_label,
 )
-from app.remote_session import RemoteSession
+from app.remote_session import RemoteSession, SshKeyError
 from app.settings import Settings
 from app.vast_client import Instance, Offer, VastAmbiguousCreateError, VastError, rank_offers
 from common.jsonio import write_json_atomic
@@ -169,7 +169,7 @@ class Orchestrator:
         store: JobStore,
         creds: CredentialStore,
         vast: VastLike,
-        session_factory: Callable[[Instance], RemoteSession],
+        session_factory: Callable[[Instance, Callable[[float], None]], RemoteSession],
         prepare: Callable[[Job], PreparedAudio],
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
@@ -552,8 +552,16 @@ class Orchestrator:
             self._attach_key_once(instance_id)
         instance = self._wait_for_endpoint(ctx, instance_id)
         self._guard(ctx)
+
+        def guarded_sleep(seconds: float) -> None:  # connect retries stop on cancel and cap
+            self._guard(ctx)
+            self._sleep(seconds)
+            self._guard(ctx)
+
         try:
-            return self._session_factory(instance)
+            return self._session_factory(instance, guarded_sleep)
+        except SshKeyError as exc:
+            raise _JobFailed(str(exc)) from None
         except LINK_ERRORS as exc:
             raise _MachineLost(f"could not connect to it ({type(exc).__name__})") from None
 

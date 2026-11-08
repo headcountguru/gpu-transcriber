@@ -84,24 +84,55 @@ def _public_text(private_key: ed25519.Ed25519PrivateKey) -> str:
     return raw.decode("ascii")
 
 
+class SshKeyError(ValueError):
+    """The app's SSH key file is missing or damaged. Retrying cannot help; the message is plain."""
+
+
+MSG_BAD_KEY = (
+    "The app's SSH key file ({name}) is missing or damaged, so the rented machine cannot be "
+    "reached. Restart the app to make a new key, then start the job again."
+)
+
+
+def _load_ed25519(path: Path) -> ed25519.Ed25519PrivateKey | None:
+    """The ed25519 private key in ``path``, or None if it is missing, empty or unreadable."""
+    try:
+        loaded = serialization.load_ssh_private_key(path.read_bytes(), password=None)
+    except (OSError, ValueError, TypeError):
+        return None
+    return loaded if isinstance(loaded, ed25519.Ed25519PrivateKey) else None
+
+
+def check_private_key(path: Path) -> None:
+    """Raise ``SshKeyError`` unless ``path`` holds a usable ed25519 private key."""
+    if _load_ed25519(path) is None:
+        raise SshKeyError(MSG_BAD_KEY.format(name=path.name))
+
+
 def ensure_ssh_key(app_dir: Path) -> tuple[Path, str]:
     """Return ``(private_key_path, public_key_text)``, generating an ed25519 pair once.
 
     The pair lives in ``app_dir`` as ``id_ed25519`` / ``id_ed25519.pub`` and is reused afterwards.
+    A private key that is empty or cannot be read is moved aside to ``id_ed25519.bad`` and a new
+    pair is made; the public file is always rewritten from the private key if it differs.
     paramiko cannot generate ed25519 keys, so ``cryptography`` does it; the private key is written
     in unencrypted OpenSSH format, which paramiko loads.
     """
     private_path = app_dir / KEY_NAME
     public_path = app_dir / f"{KEY_NAME}.pub"
     if private_path.is_file():
-        if public_path.is_file():
-            return private_path, public_path.read_text(encoding="ascii").strip()
-        loaded = serialization.load_ssh_private_key(private_path.read_bytes(), password=None)
-        if not isinstance(loaded, ed25519.Ed25519PrivateKey):
-            raise ValueError(f"{private_path} is not an ed25519 key")
-        public = _public_text(loaded)
-        public_path.write_text(public + "\n", encoding="ascii")
-        return private_path, public
+        loaded = _load_ed25519(private_path)
+        if loaded is not None:
+            public = _public_text(loaded)
+            try:
+                current = public_path.read_text(encoding="ascii").strip()
+            except (OSError, UnicodeDecodeError):
+                current = ""
+            if current != public:
+                public_path.write_text(public + "\n", encoding="ascii")
+            return private_path, public
+        logger.warning("The SSH key file is empty or damaged; making a new one")
+        private_path.replace(app_dir / f"{KEY_NAME}.bad")
 
     app_dir.mkdir(parents=True, exist_ok=True)
     key = ed25519.Ed25519PrivateKey.generate()
