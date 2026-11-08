@@ -9,9 +9,13 @@ so it stops billing.
 
 You get three files for each job:
 
-- `transcript.txt` - the plain transcript.
-- `transcript_timestamped.txt` - the same text with times.
-- `transcript.srt` - subtitles.
+- `<title>-transcript.txt` - the plain transcript.
+- `<title>-transcript_timestamped.txt` - the same text with times.
+- `<title>-transcript.srt` - subtitles.
+
+`<title>` is the name of your audio file or the title of the YouTube video, without a file
+extension such as `.mp3`. For `Board meeting.mp3` you get `Board meeting-transcript.txt` and so on.
+Characters Windows does not allow in file names are removed, and long titles are shortened.
 
 Speakers are labeled `SPEAKER_00`, `SPEAKER_01` and so on. The app does not guess names.
 

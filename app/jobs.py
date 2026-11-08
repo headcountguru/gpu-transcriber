@@ -45,6 +45,15 @@ _STAGE_TO_STATE: dict[str, JobState] = {
 }
 
 
+def output_file_name(base_name: str, remote_name: str) -> str:
+    """Name a finished file after its recording: ``<title>-transcript.txt`` and so on.
+
+    ``remote_name`` is what the machine calls the file (``transcript.txt``,
+    ``transcript_timestamped.txt``, ``transcript.srt``); the title never has a media extension.
+    """
+    return f"{base_name}-{remote_name}"
+
+
 def state_for_stage(stage: str) -> JobState:
     """Map a remote runner stage name to the job state shown in the app."""
     try:

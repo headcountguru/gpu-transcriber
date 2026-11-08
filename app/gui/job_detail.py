@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 
 from app.gui import theme
 from app.gui.new_job_panel import EMPTY_STATE_TEXT
-from app.jobs import TERMINAL_STATES, Job, JobState
+from app.jobs import TERMINAL_STATES, Job, JobState, output_file_name
 from app.presenter import (
     alarm_text,
     cost_text,
@@ -301,13 +301,24 @@ class JobDetail(QWidget):
             return
         self.show_notice("")
 
-    def _open_output(self, name: str) -> None:
+    def _output_path(self, remote_name: str) -> Path | None:
+        """The finished file: ``<title>-<remote_name>``, or the plain name for older jobs."""
         folder = self._output_dir()
-        path = folder / name if folder is not None else None
+        if folder is None or self._job is None:
+            return None
+        named = folder / output_file_name(self._job.name, remote_name)
+        if named.is_file():
+            return named
+        legacy = folder / remote_name
+        return legacy if legacy.is_file() else named
+
+    def _open_output(self, name: str) -> None:
+        path = self._output_path(name)
         if path is None or not path.is_file():
-            self.show_notice(f"Can't find {name}. It may have been moved or deleted.")
+            shown = output_file_name(self._job.name, name) if self._job else name
+            self.show_notice(f"Can't find {shown}. It may have been moved or deleted.")
             return
-        self._open(path, name)
+        self._open(path, path.name)
 
     def _show_folder(self) -> None:
         folder = self._output_dir()

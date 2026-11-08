@@ -326,8 +326,9 @@ def test_happy_path_downloads_outputs_and_destroys_instance(world: World) -> Non
 
     assert job.state is JobState.DONE
     out = world.store.job_dir(job.id) / "output"
-    assert sorted(p.name for p in out.iterdir()) == sorted(OUTPUT_FILES)
-    assert all((out / name).stat().st_size > 0 for name in OUTPUT_FILES)
+    expected = [f"talk-{name}" for name in OUTPUT_FILES]  # named after the recording
+    assert sorted(p.name for p in out.iterdir()) == sorted(expected)
+    assert all((out / name).stat().st_size > 0 for name in expected)
     assert world.vast.instances == {}
     assert job.instance_id is None
     assert job.output_dir == str(out)
@@ -808,3 +809,9 @@ def test_build_onstart_starts_the_watchdog_for_the_job_dir() -> None:
     assert "watchdog.py" in script
     assert f"--job-dir {REMOTE_DIR}" in script
     assert "PYTHONPATH=/app:/app/remote" in script
+
+
+def test_submit_drops_a_media_extension_from_the_name(world: World) -> None:
+    job = world.orch.submit("C:/audio/talk.mp3", is_youtube=False, name="Town Hall 2026.MP3")
+
+    assert job.name == "Town Hall 2026"

@@ -43,7 +43,13 @@ from pathlib import Path, PureWindowsPath
 from app.credentials import HF_TOKEN, VAST_API_KEY, CredentialError, CredentialStore
 from app.estimate import default_cost_cap, estimate_job
 from app.jobs import TERMINAL_STATES, Job, JobState, JobStore, state_for_stage
-from app.media_prep import UNTITLED, MediaPrepError, PreparedAudio, safe_folder_name
+from app.media_prep import (
+    UNTITLED,
+    MediaPrepError,
+    PreparedAudio,
+    safe_folder_name,
+    strip_media_extension,
+)
 from app.orchestrator_support import (
     LINK_ERRORS,
     MSG_NO_UNTRIED_OFFER,
@@ -208,7 +214,7 @@ class Orchestrator:
             title = PureWindowsPath(source).stem
         job = Job(
             id=uuid.uuid4().hex,
-            name=safe_folder_name(title),
+            name=safe_folder_name(strip_media_extension(title)),
             source=source,
             is_youtube=is_youtube,
             state=JobState.PREPARING,
@@ -411,7 +417,7 @@ class Orchestrator:
             "duration_s": prepared.duration_s,
         }
         if job.is_youtube and job.name == UNTITLED:
-            changes["name"] = safe_folder_name(prepared.title)
+            changes["name"] = safe_folder_name(strip_media_extension(prepared.title))
         ctx.save(**changes)
 
     # --- machines -------------------------------------------------------------------------------
@@ -704,7 +710,7 @@ class Orchestrator:
         ctx.save(state=JobState.SAVING, message="Downloading the transcript")
         out = self._store.job_dir(ctx.job.id) / LOCAL_OUTPUT_DIR
         remote_out = f"{self._settings.remote_job_dir}/{JOB_OUTPUT_DIR}"
-        problems = pull_outputs(session, remote_out, out)
+        problems = pull_outputs(session, remote_out, out, ctx.job.name)
         if problems:
             raise _JobFailed(
                 "The machine finished, but these transcript files did not arrive complete: "

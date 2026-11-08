@@ -7,7 +7,12 @@ import threading
 import time
 from pathlib import Path
 
-from app.jobs import Job, JobState, JobStore
+from app.jobs import (
+    Job,
+    JobState,
+    JobStore,
+    output_file_name,  # noqa: E402
+)
 from common.protocol import OUTPUT_FILES
 
 BLOCK_TIMEOUT_S = 10.0
@@ -44,11 +49,11 @@ def make_job(job_id: str = "job1", **changes: object) -> Job:
 def done_job_with_files(store: JobStore, job_id: str = "done1") -> Job:
     out = store.job_dir(job_id) / "output"
     out.mkdir(parents=True, exist_ok=True)
-    for name in OUTPUT_FILES:
-        (out / name).write_text("text", encoding="utf-8")
     job = make_job(
         job_id, state=JobState.DONE, output_dir=str(out), percent=100, cost_so_far=0.4, cost_cap=2.0
     )
+    for name in OUTPUT_FILES:
+        (out / output_file_name(job.name, name)).write_text("text", encoding="utf-8")
     store.save(job)
     return job
 

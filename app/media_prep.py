@@ -140,6 +140,22 @@ class PreparedAudio:
     size_bytes: int
 
 
+_MEDIA_EXTENSION = re.compile(
+    r"\.(mp3|mp4|m4a|m4b|aac|wav|wave|flac|ogg|oga|opus|wma|webm|mkv|mov|avi|wmv|flv|mpg|mpeg|3gp)$",
+    re.IGNORECASE,
+)
+
+
+def strip_media_extension(title: str) -> str:
+    """Remove trailing media file extensions (``.mp3``, ``.MP4``...) from a title or file name."""
+    stripped = title
+    while True:
+        shorter = _MEDIA_EXTENSION.sub("", stripped)
+        if shorter == stripped or not shorter:
+            return stripped
+        stripped = shorter
+
+
 def safe_folder_name(title: str) -> str:
     """Turn a title into a name that is safe as a Windows folder name (80 characters at most)."""
     cleaned = " ".join(_ILLEGAL_CHARS.sub("", title).split())

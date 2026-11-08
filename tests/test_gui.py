@@ -310,14 +310,32 @@ def test_finished_job_shows_three_open_buttons(
     detail.open_subtitles_button.click()
     detail.show_folder_button.click()
     out = Path(job.output_dir or "")
-    assert opened == [str(out / "transcript.txt"), str(out / "transcript.srt"), str(out)]
+    assert opened == [
+        str(out / f"{job.name}-transcript.txt"),
+        str(out / f"{job.name}-transcript.srt"),
+        str(out),
+    ]
+
+
+def test_jobs_finished_before_the_rename_still_open_their_old_file_names(
+    make_window: Callable[..., MainWindow], store: JobStore, opened: list[str]
+) -> None:
+    job = done_job_with_files(store)
+    out = Path(job.output_dir or "")
+    (out / f"{job.name}-transcript.txt").rename(out / "transcript.txt")
+    window = make_window()
+    window.select_job(job.id)
+
+    window.job_detail.open_transcript_button.click()
+
+    assert opened == [str(out / "transcript.txt")]
 
 
 def test_open_missing_file_shows_plain_message(
     make_window: Callable[..., MainWindow], store: JobStore, opened: list[str]
 ) -> None:
     job = done_job_with_files(store)
-    (Path(job.output_dir or "") / "transcript_timestamped.txt").unlink()
+    (Path(job.output_dir or "") / f"{job.name}-transcript_timestamped.txt").unlink()
     window = make_window()
     window.select_job(job.id)
     window.job_detail.open_timestamped_button.click()

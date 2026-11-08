@@ -16,7 +16,7 @@ from typing import Protocol
 
 import paramiko
 
-from app.jobs import TERMINAL_STATES, Job, JobState, JobStore
+from app.jobs import TERMINAL_STATES, Job, JobState, JobStore, output_file_name
 from app.remote_session import RemoteSession
 from app.settings import Settings
 from app.vast_client import Instance, Offer, VastError
@@ -246,21 +246,25 @@ def pull_checkpoints(session: RemoteSession, remote_dir: str, local_dir: Path) -
     return pulled
 
 
-def pull_outputs(session: RemoteSession, remote_dir: str, local_dir: Path) -> list[str]:
-    """Download the three output files; return the names missing or empty afterwards.
+def pull_outputs(
+    session: RemoteSession, remote_dir: str, local_dir: Path, base_name: str
+) -> list[str]:
+    """Download the three output files as ``<base_name>-transcript.txt`` and so on.
 
-    A file the machine does not have counts as missing; other link errors are raised.
+    Returns the local names that are missing or empty afterwards. A file the machine does not
+    have counts as missing; other link errors are raised.
     """
     problems: list[str] = []
     for name in OUTPUT_FILES:
-        target = local_dir / name
+        local_name = output_file_name(base_name, name)
+        target = local_dir / local_name
         try:
             session.download(f"{remote_dir}/{name}", target)
         except FileNotFoundError:
-            problems.append(name)
+            problems.append(local_name)
             continue
         if not target.is_file() or target.stat().st_size == 0:
-            problems.append(name)
+            problems.append(local_name)
     return problems
 
 
