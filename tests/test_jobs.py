@@ -69,7 +69,8 @@ def test_store_skips_corrupt_job_file(tmp_path: Path, caplog: pytest.LogCaptureF
         jobs = store.load_all()
 
     assert [j.id for j in jobs] == ["good"]
-    assert any("job.json" in r.getMessage() for r in caplog.records)
+    skipped = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Skipping")]
+    assert any(" bad:" in m for m in skipped) and any(" wrong:" in m for m in skipped)
 
 
 def test_load_all_on_missing_root_returns_empty(tmp_path: Path) -> None:
@@ -157,3 +158,80 @@ def test_terminal_states_exclude_running_states() -> None:
         JobState.SAVING,
     ):
         assert running not in TERMINAL_STATES
+
+
+def _write_raw(root: Path, job_id: str, raw: str) -> None:
+    folder = root / job_id
+    folder.mkdir()
+    (folder / "job.json").write_text(raw, encoding="utf-8")
+
+
+def _job_json(**overrides: object) -> str:
+    data: dict[str, object] = {
+        "id": "x",
+        "name": "n",
+        "source": "s",
+        "is_youtube": False,
+        "state": "PREPARING",
+        "created_at": 5.0,
+    }
+    data.update(overrides)
+    return json.dumps(data)
+
+
+_BAD_FILES = {
+    "created_at_string": _job_json(created_at="x"),
+    "created_at_null": _job_json(created_at=None),
+    "created_at_bool": _job_json(created_at=True),
+    "created_at_nan": _job_json(created_at=float("nan")),
+    "created_at_inf": _job_json(created_at=float("inf")),
+    "non_dict": "[]",
+    "unknown_state": _job_json(state="EXPLODED"),
+    "state_not_string": _job_json(state=3),
+    "name_not_string": _job_json(name=7),
+    "is_youtube_not_bool": _job_json(is_youtube="yes"),
+    "percent_bool": _job_json(percent=True),
+    "percent_string": _job_json(percent="50"),
+    "chunk_string": _job_json(chunk="1"),
+    "price_string": _job_json(price_per_hour="0.5"),
+    "error_number": _job_json(error=5),
+}
+
+
+def test_load_all_skips_wrong_typed_files_and_keeps_good_ones(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = JobStore(tmp_path)
+    store.save(make_job("good", created_at=1.0))
+    for name, raw in _BAD_FILES.items():
+        _write_raw(tmp_path, f"bad_{name}", raw)
+
+    with caplog.at_level(logging.WARNING):
+        jobs = store.load_all()
+
+    assert [j.id for j in jobs] == ["good"]
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "bad_created_at_string" in messages
+
+
+@pytest.mark.parametrize("name", sorted(_BAD_FILES))
+def test_get_raises_value_error_for_corrupt_file(tmp_path: Path, name: str) -> None:
+    _write_raw(tmp_path, "bad", _BAD_FILES[name])
+
+    with pytest.raises(ValueError):
+        JobStore(tmp_path).get("bad")
+
+
+def test_get_raises_value_error_for_unparseable_json(tmp_path: Path) -> None:
+    _write_raw(tmp_path, "bad", "{not json")
+
+    with pytest.raises(ValueError):
+        JobStore(tmp_path).get("bad")
+
+
+def test_integer_created_at_and_pay_fields_are_accepted(tmp_path: Path) -> None:
+    _write_raw(tmp_path, "ok", _job_json(created_at=5, price_per_hour=1, duration_s=60))
+
+    job = JobStore(tmp_path).get("ok")
+
+    assert job.created_at == 5 and job.price_per_hour == 1
