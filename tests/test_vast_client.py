@@ -382,6 +382,16 @@ def test_get_balance_falls_back_to_credit_field(client):
 
 
 @responses.activate
+def test_get_balance_prefers_credit_over_a_zero_balance(client):
+    # Shape of a real credit-only account: $10 prepaid credit, "balance" is 0.
+    responses.get(
+        f"{BASE}/users/current/",
+        json={"id": 1, "balance": 0, "credit": 10, "billing_creditonly": 1, "total_spend": 0},
+    )
+    assert client.get_balance() == 10.0
+
+
+@responses.activate
 def test_get_balance_raises_when_no_balance_in_response(client):
     responses.get(f"{BASE}/users/current/", json={"id": 1})
     with pytest.raises(VastError):

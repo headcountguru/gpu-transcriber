@@ -25,8 +25,8 @@ still pass a 16 GB minimum). ``inet_down`` is already Mb/s (CLI docs), so it is 
 # UNCONFIRMED: ``hosting_type >= 1`` as datacenter. Task 9 should check a real datacenter offer.
 # UNCONFIRMED: ``gpu_ram`` divisor (1000 vs 1024) and the ``inet_down`` unit (Mb/s vs MB/s: the
 # UNCONFIRMED: REST page says MB/s, the CLI page says Mb/s; we follow the CLI).
-# UNCONFIRMED: balance field name: ``show user`` says ``balance`` but the authentication page
-# UNCONFIRMED: example shows ``credit``; ``get_balance`` accepts either.
+# CONFIRMED live (2026-11-07, credit-only account): ``GET /users/current/`` returns ``credit: 10``
+# CONFIRMED live: and ``balance: 0``; ``get_balance`` therefore prefers ``credit`` over ``balance``.
 # UNCONFIRMED: ``POST /bundles/`` ``limit`` ceiling and whether ``order`` is honoured as sent.
 # UNCONFIRMED: trailing slashes on ``/bundles/``, ``/asks/{id}/``, ``/instances/{id}/``,
 # UNCONFIRMED: ``/users/current/`` follow the doc examples; ``/ssh/`` is from the CLI convention
@@ -307,7 +307,9 @@ class VastClient:
         data = self._call("GET", f"{self._base_url}/users/current/", "read your Vast.ai balance")
         value = None
         if isinstance(data, dict):
-            value = data.get("balance") if data.get("balance") is not None else data.get("credit")
+            # A live credit-only account reports prepaid money as "credit" and a "balance" of 0,
+            # so "credit" wins whenever present; "balance" (the documented field) is the fallback.
+            value = data.get("credit") if data.get("credit") is not None else data.get("balance")
         try:
             return float(value)  # type: ignore[arg-type]
         except (TypeError, ValueError):
