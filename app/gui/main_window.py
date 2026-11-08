@@ -2,8 +2,9 @@
 
 Every slow call runs on a worker thread: job runs (``JobWorker``), the start-up check
 (``resume_pending`` then ``reap_orphans``) and the periodic ``retry_unconfirmed_destroys``.
-Jobs started while the start-up check runs wait for it, so ``resume_pending`` never sees a job
-this window is about to run.
+Jobs started, and raised caps, while the start-up check runs wait for it, so ``resume_pending``
+never sees a job this window is about to run. A failed start-up check leaves a lasting warning
+in the status bar and is retried every 2 minutes, once no job or other check is running.
 """
 
 import html
@@ -60,6 +61,11 @@ CLOSE_TEXT = (
 )
 MSG_STARTUP_CHECK = "Checking for unfinished jobs and leftover machines…"
 MSG_WAITING_FOR_STARTUP = "The job will start as soon as the startup check finishes."
+MSG_CAP_WAITING_FOR_STARTUP = "The job will continue as soon as the startup check finishes."
+STARTUP_RETRY_MS = 2 * 60 * 1000
+MSG_STARTUP_RETRYING = (
+    "⚠ Could not check for unfinished jobs and leftover machines; retrying every 2 minutes."
+)
 KEYS_TOOLTIP = "Change the Vast.ai API key or the Hugging Face token"
 KEYS_LOCKED_TOOLTIP = "Finish or cancel running jobs before changing keys"
 MSG_JOB_FILE_MISSING = "This job's saved file is missing or damaged."
@@ -199,6 +205,7 @@ class MainWindow(QMainWindow):
         ask_new_cap: Callable[[Job], float | None] | None = None,
         run_startup: bool = True,
         retry_interval_ms: int = RETRY_INTERVAL_MS,
+        startup_retry_ms: int = STARTUP_RETRY_MS,
     ) -> None:
         super().__init__()
         self._orch = orchestrator
@@ -215,11 +222,13 @@ class MainWindow(QMainWindow):
         self._startup_worker: TaskWorker | None = None
         self._retry_worker: TaskWorker | None = None
         self._deferred: list[tuple[str, bool]] = []
+        self._deferred_caps: list[tuple[str, float]] = []
         self._pending_resumed: tuple[str, ...] = ()
         self.setWindowTitle("GPU Transcriber")
         self.setMinimumSize(MIN_WIDTH, MIN_HEIGHT)
         self.setStyleSheet(theme.STYLESHEET)
         self._build(probe, opener)
+        self._build_status_slots()
         for job in store.load_all():
             self._upsert(job)
         self._retry_timer = QTimer(self)
@@ -227,6 +236,10 @@ class MainWindow(QMainWindow):
         self._retry_timer.timeout.connect(self._start_retry)
         if retry_interval_ms > 0:
             self._retry_timer.start()
+        self._startup_retry_timer = QTimer(self)
+        self._startup_retry_timer.setSingleShot(True)
+        self._startup_retry_timer.setInterval(max(1, startup_retry_ms))
+        self._startup_retry_timer.timeout.connect(self._retry_startup)
         if run_startup:
             self._start_startup()
 
@@ -251,6 +264,23 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.setTabOrder(self.new_button, self.job_list)
         self.setTabOrder(self.job_list, self.keys_button)
+
+    def _build_status_slots(self) -> None:
+        """Lasting notices in the status bar, which passing messages can never overwrite."""
+        self.startup_warning = QLabel()
+        self.startup_warning.setObjectName("startupWarning")
+        self.tools_label = QLabel()
+        self.tools_label.setObjectName("toolsNotice")
+        for label in (self.startup_warning, self.tools_label):
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            self.statusBar().addPermanentWidget(label)
+            label.setVisible(False)
+
+    def show_tools_problem(self, message: str) -> None:
+        """A problem with a helper tool (yt-dlp), kept in its own status slot."""
+        self.tools_label.setText(message)
+        self.tools_label.setToolTip(plain_tooltip(message))
+        self.tools_label.setVisible(bool(message))
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
@@ -436,6 +466,15 @@ class MainWindow(QMainWindow):
         new_cap = self._ask_new_cap(job)
         if new_cap is None:
             return
+        if self._startup_worker is not None:
+            # The startup check could otherwise mark this job failed or remove its machine.
+            self._deferred_caps.append((job_id, new_cap))
+            self._notices[job_id] = MSG_CAP_WAITING_FOR_STARTUP
+            self._refresh_detail()
+            return
+        self._raise_and_start(job_id, new_cap)
+
+    def _raise_and_start(self, job_id: str, new_cap: float) -> None:
         try:
             updated = self._orch.raise_cap_and_continue(job_id, new_cap)
         except ValueError as exc:
@@ -458,7 +497,7 @@ class MainWindow(QMainWindow):
         orchestrator = self._orch
         worker = TaskWorker(lambda: run_startup_tasks(orchestrator), "Startup check", self)
         worker.succeeded.connect(self._on_startup_done)
-        worker.failed.connect(self._on_background_failed)
+        worker.failed.connect(self._show_startup_problem)
         worker.finished.connect(self._on_startup_finished)
         self._startup_worker = worker
         self.statusBar().showMessage(MSG_STARTUP_CHECK, STATUS_TIMEOUT_MS)
@@ -469,11 +508,31 @@ class MainWindow(QMainWindow):
         if not isinstance(result, StartupResult):
             return
         self._reload_from_store()
+        self.statusBar().clearMessage()
         if result.problems:
-            self.statusBar().showMessage(" ".join(result.problems), STATUS_TIMEOUT_MS)
+            self._show_startup_problem(" ".join(result.problems))
         else:
-            self.statusBar().clearMessage()
+            self.startup_warning.setVisible(False)
         self._pending_resumed = result.resumed
+
+    def _show_startup_problem(self, detail: str) -> None:
+        """Keep a lasting warning up and try the whole startup check again later."""
+        self.startup_warning.setText(MSG_STARTUP_RETRYING)
+        self.startup_warning.setToolTip(plain_tooltip(detail))
+        self.startup_warning.setVisible(True)
+        self._startup_retry_timer.start()
+
+    def _retry_startup(self) -> None:
+        """Run the startup check again, but only when nothing else is going on.
+
+        A job being started could otherwise be seen by ``resume_pending`` before its run has
+        claimed it; jobs and other checks therefore go first and the retry waits for them.
+        """
+        busy = self._startup_worker is not None or self._retry_worker is not None
+        if busy or self._workers:
+            self._startup_retry_timer.start()
+            return
+        self._start_startup()
 
     def _on_startup_finished(self) -> None:
         worker = self._startup_worker
@@ -487,6 +546,10 @@ class MainWindow(QMainWindow):
         deferred, self._deferred = self._deferred, []
         for source, is_youtube in deferred:
             self._submit(source, is_youtube)
+        caps, self._deferred_caps = self._deferred_caps, []
+        for job_id, new_cap in caps:
+            self._notices.pop(job_id, None)
+            self._raise_and_start(job_id, new_cap)
         self._update_keys_button()
 
     def _start_retry(self) -> None:
@@ -516,6 +579,7 @@ class MainWindow(QMainWindow):
 
     def stop_background_timers(self) -> None:
         self._retry_timer.stop()
+        self._startup_retry_timer.stop()
 
     # --- keys and closing -----------------------------------------------------------------------
 

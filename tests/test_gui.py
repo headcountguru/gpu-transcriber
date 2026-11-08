@@ -611,9 +611,10 @@ def test_startup_failure_is_reported_not_raised(
     orch.resume_pending = broken  # type: ignore[method-assign]
     window = make_window(run_startup=True)
     qtbot.waitUntil(lambda: "reap_orphans" in orch.calls, timeout=WAIT_MS)  # type: ignore[attr-defined]
-    qtbot.waitUntil(  # type: ignore[attr-defined]
-        lambda: "could not" in window.statusBar().currentMessage().lower(), timeout=WAIT_MS
-    )
+    qtbot.waitUntil(lambda: window.startup_warning.isVisible(), timeout=WAIT_MS)  # type: ignore[attr-defined]
+    assert "could not" in window.startup_warning.text().lower()
+    assert "unfinished jobs" in window.startup_warning.toolTip().lower()  # the detail
+    window.stop_background_timers()  # the retry would run the broken check again
 
 
 def test_retry_destroys_runs_periodically_off_the_ui_thread(

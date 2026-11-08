@@ -261,7 +261,7 @@ def run_app(data_dir: Path) -> int:
         setup_dialog_factory=make_setup,
     )
     warm = TaskWorker(ytdlp, "yt-dlp download", window)  # never blocks start-up
-    warm.failed.connect(window.statusBar().showMessage)
+    warm.failed.connect(window.show_tools_problem)  # its own slot: never hides other warnings
     warm.start()
     window.show()
     code = int(application.exec())
