@@ -4,6 +4,8 @@ import logging
 import threading
 
 import pytest
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QLabel, QLineEdit
 
 from app.credentials import HF_TOKEN, VAST_API_KEY, CredentialStore
 from app.gui.setup_dialog import SetupDialog
@@ -12,8 +14,8 @@ from app.vast_client import VastError
 from tests.gui_fakes import FakeBackend
 
 WAIT_MS = 5000
-VAST_KEY = "vastkey_0123456789abcdefWXYZ"
-HF = "hf_secret_token_0123456789QRST"
+VAST_KEY = "QZXJ9W7KQV3PZJXQ8VKW"
+HF = "hf_ZQJX8V6WKQPZ4JXQ"
 SERVICE = "GpuTranscriber"
 
 
@@ -39,7 +41,21 @@ def submit(qtbot: object, dialog: SetupDialog) -> None:
 
 
 def visible_text(dialog: SetupDialog) -> str:
-    return " ".join([dialog.vast_status.text(), dialog.hf_status.text(), dialog.windowTitle()])
+    """Every text the dialog can show: labels, title, and what the input fields display."""
+    labels = [label.text() for label in dialog.findChildren(QLabel)]
+    fields = [edit.displayText() for edit in dialog.findChildren(QLineEdit)]
+    return " ".join([*labels, *fields, dialog.windowTitle()])
+
+
+def assert_no_key_fragment(dialog: SetupDialog) -> None:
+    """No piece of either key (any 3 characters in a row) appears anywhere in the dialog.
+
+    The keys use runs like ``QZX`` that occur in no English text, so any match is a leak.
+    """
+    text = visible_text(dialog)
+    for secret in (VAST_KEY, HF):
+        for start in range(len(secret) - 2):
+            assert secret[start : start + 3] not in text
 
 
 def test_instructions_explain_two_factor_permissions_credit_and_model_terms(qtbot: object) -> None:
@@ -82,10 +98,11 @@ def test_saves_only_after_both_checks_pass_and_masks_keys(
     assert backend.data == {(SERVICE, VAST_API_KEY): VAST_KEY, (SERVICE, HF_TOKEN): HF}
     assert dialog.result() == SetupDialog.DialogCode.Accepted
     assert dialog.balance == pytest.approx(12.5)
+    assert dialog.vast_status.text().startswith("Saved")
     assert "$12.50" in dialog.vast_status.text()
-    assert "WXYZ" in dialog.vast_status.text()
-    assert VAST_KEY not in visible_text(dialog)
-    assert HF not in visible_text(dialog)
+    assert dialog.hf_status.text().startswith("Saved")
+    assert "tom" in dialog.hf_status.text()
+    assert_no_key_fragment(dialog)
     assert VAST_KEY not in caplog.text and HF not in caplog.text
     assert threads and threads[0] != threading.get_ident()
 
@@ -114,6 +131,9 @@ def test_models_not_accepted_are_named_and_nothing_saved(qtbot: object) -> None:
     status = dialog.hf_status.text()
     assert SEGMENTATION_MODEL in status
     assert DIARIZATION_MODEL not in status.replace(SEGMENTATION_MODEL, "")
+    assert not status.startswith("Saved")
+    assert not dialog.vast_status.text().startswith("Saved")  # nothing was saved
+    assert_no_key_fragment(dialog)
 
 
 def test_hf_check_error_saves_nothing(qtbot: object) -> None:
@@ -137,8 +157,19 @@ def test_unexpected_error_in_check_is_plain_and_secret_free(qtbot: object) -> No
     dialog = build(qtbot, backend, check_vast, lambda t: granted())
     submit(qtbot, dialog)
     assert backend.data == {}
-    assert VAST_KEY not in visible_text(dialog)
+    assert_no_key_fragment(dialog)
     assert "went wrong" in dialog.vast_status.text().lower()
+
+
+def test_status_and_error_text_is_plain_text(qtbot: object) -> None:
+    def check_vast(key: str) -> float:
+        raise VastError('<a href="https://evil">Vast.ai said no</a>')
+
+    dialog = build(qtbot, FakeBackend(), check_vast, lambda t: granted())
+    submit(qtbot, dialog)
+    for label in (dialog.vast_status, dialog.hf_status, dialog.form_status):
+        assert label.textFormat() == Qt.TextFormat.PlainText
+    assert dialog.vast_status.text() == '<a href="https://evil">Vast.ai said no</a>'
 
 
 def test_empty_fields_ask_for_both_values(qtbot: object) -> None:

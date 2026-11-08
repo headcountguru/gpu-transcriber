@@ -1,11 +1,9 @@
 """Turns jobs and user input into the plain words the window shows. No Qt here."""
 
-import os
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from app.jobs import TERMINAL_STATES, Job, JobState
-from app.media_prep import MSG_MISSING, MediaPrepError, check_youtube_url
+from app.media_prep import MediaPrepError, check_youtube_url
 
 DONE = "done"
 ACTIVE = "active"
@@ -52,9 +50,6 @@ _STATUS_KIND = {
 MSG_EMPTY_INPUT = "Paste a YouTube link or choose an audio file."
 CAP_STEP = 0.01
 CAP_SUGGESTION_MULTIPLE = 2.0
-SECRET_TAIL = 4
-SECRET_MIN_FOR_TAIL = 12
-MASK = "••••"
 _LINK_PREFIXES = ("http://", "https://", "www.", "youtube.com", "youtu.be", "m.youtube.com")
 
 
@@ -68,12 +63,18 @@ class StageRow:
 
 @dataclass(frozen=True)
 class SourceCheck:
-    """What the new-job input holds: ``ok`` means Play can start it."""
+    """What the new-job input holds.
+
+    ``ok`` means Play can start it now (a valid link). ``needs_file_check`` means it is a path:
+    whether the file exists is checked on a worker thread, never here, because a network share
+    or a sleeping mapped drive can block for seconds.
+    """
 
     source: str
     is_youtube: bool
     ok: bool
     error: str | None
+    needs_file_check: bool = False
 
 
 def _labeling_label(job: Job) -> str:
@@ -175,8 +176,11 @@ def _looks_like_link(text: str) -> bool:
     return lowered.startswith(_LINK_PREFIXES) or "://" in lowered
 
 
-def check_source(text: str, is_file: Callable[[str], bool] = os.path.isfile) -> SourceCheck:
-    """Classify the new-job input as a YouTube link, an existing file, or a plain error."""
+def check_source(text: str) -> SourceCheck:
+    """Classify the new-job input as a YouTube link, a path to check, or a plain error.
+
+    Text only: this never touches the filesystem (it runs on every keystroke).
+    """
     cleaned = text.strip().strip('"').strip()
     if not cleaned:
         return SourceCheck(source="", is_youtube=False, ok=False, error=None)
@@ -186,15 +190,8 @@ def check_source(text: str, is_file: Callable[[str], bool] = os.path.isfile) -> 
         except MediaPrepError as exc:
             return SourceCheck(source=cleaned, is_youtube=True, ok=False, error=str(exc))
         return SourceCheck(source=link, is_youtube=True, ok=True, error=None)
-    if is_file(cleaned):
-        return SourceCheck(source=cleaned, is_youtube=False, ok=True, error=None)
-    looks_like_path = "\\" in cleaned or "/" in cleaned or ":" in cleaned
-    error = MSG_MISSING if looks_like_path else MSG_EMPTY_INPUT
-    return SourceCheck(source=cleaned, is_youtube=False, ok=False, error=error)
-
-
-def mask_secret(secret: str) -> str:
-    """Show at most the last four characters of a long secret, never the whole value."""
-    if len(secret) < SECRET_MIN_FOR_TAIL:
-        return MASK
-    return MASK + secret[-SECRET_TAIL:]
+    if "\\" in cleaned or "/" in cleaned or ":" in cleaned:
+        return SourceCheck(
+            source=cleaned, is_youtube=False, ok=False, error=None, needs_file_check=True
+        )
+    return SourceCheck(source=cleaned, is_youtube=False, ok=False, error=MSG_EMPTY_INPUT)

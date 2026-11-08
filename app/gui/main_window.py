@@ -6,6 +6,7 @@ Jobs started while the start-up check runs wait for it, so ``resume_pending`` ne
 this window is about to run.
 """
 
+import html
 import logging
 import os
 import threading
@@ -14,7 +15,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QPainter, QPaintEvent
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -41,7 +43,6 @@ logger = logging.getLogger(__name__)
 
 RETRY_INTERVAL_MS = 5 * 60 * 1000
 SIDEBAR_WIDTH = 300
-LIST_TEXT_INSET = 48  # row margins plus room for a vertical scroll bar
 ROW_EXTRA_PX = 4  # the row's bottom border would otherwise clip descenders (g, p, y)
 MIN_WIDTH = 900
 MIN_HEIGHT = 600
@@ -53,6 +54,8 @@ CLOSE_TEXT = (
 )
 MSG_STARTUP_CHECK = "Checking for unfinished jobs and leftover machines…"
 MSG_WAITING_FOR_STARTUP = "The job will start as soon as the startup check finishes."
+KEYS_TOOLTIP = "Change the Vast.ai API key or the Hugging Face token"
+KEYS_LOCKED_TOOLTIP = "Finish or cancel running jobs before changing keys"
 MSG_JOB_FILE_MISSING = "This job's saved file is missing or damaged."
 
 
@@ -113,9 +116,27 @@ def confirm_close_dialog(parent: QWidget) -> bool:
     return answer == QMessageBox.StandardButton.Yes
 
 
-def _elide(label: QLabel, text: str) -> str:
-    width = SIDEBAR_WIDTH - LIST_TEXT_INSET
-    return label.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, width)
+class ElidedLabel(QLabel):
+    """A plain-text label that keeps its full text but paints it cut short with "…" if needed."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        rect = self.contentsRect()
+        text = self.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideRight, rect.width())
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        painter.drawText(
+            rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text
+        )
+
+
+def plain_tooltip(text: str) -> str:
+    """Tooltips guess rich text like labels do; escaping makes job text show literally."""
+    return html.escape(text) if text else ""
 
 
 class JobListItem(QWidget):
@@ -123,11 +144,12 @@ class JobListItem(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.name_label = QLabel()
+        self.name_label = ElidedLabel()
         self.name_label.setObjectName("jobName")
-        self.summary_label = QLabel()
+        self.summary_label = ElidedLabel()
         self.summary_label.setObjectName("jobSummary")
         self.alarm_label = QLabel("⚠ Machine may still be running")
+        self.alarm_label.setTextFormat(Qt.TextFormat.PlainText)
         self.alarm_label.setObjectName("jobAlarm")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 10, 12, 10)
@@ -137,15 +159,15 @@ class JobListItem(QWidget):
         layout.addWidget(self.alarm_label)
 
     def show_job(self, job: Job) -> None:
-        self.name_label.setText(_elide(self.name_label, job.name))
-        self.name_label.setToolTip(job.name)
+        self.name_label.setText(job.name)
+        self.name_label.setToolTip(plain_tooltip(job.name))
         summary = summary_line(job)
-        self.summary_label.setText(_elide(self.summary_label, summary))
-        self.summary_label.setToolTip(summary)
+        self.summary_label.setText(summary)
+        self.summary_label.setToolTip(plain_tooltip(summary))
         theme.set_kind(self.summary_label, status_kind(job))
         alarm = alarm_text(job)
         self.alarm_label.setVisible(alarm is not None)
-        self.alarm_label.setToolTip(alarm or "")
+        self.alarm_label.setToolTip(plain_tooltip(alarm or ""))
 
 
 class MainWindow(QMainWindow):
@@ -239,8 +261,8 @@ class MainWindow(QMainWindow):
         self.job_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.job_list.currentItemChanged.connect(self._on_current_changed)
         self.keys_button = QPushButton("Accounts and keys…")
-        self.keys_button.setToolTip("Change the Vast.ai API key or the Hugging Face token")
-        self.keys_button.clicked.connect(self._on_keys)
+        self.keys_button.setToolTip(KEYS_TOOLTIP)
+        self.keys_button.clicked.connect(self.open_keys_dialog)
         self.keys_button.setVisible(self._setup_dialog_factory is not None)
         footer = QHBoxLayout()
         footer.setContentsMargins(16, 10, 16, 14)
@@ -368,6 +390,7 @@ class MainWindow(QMainWindow):
         worker.ended.connect(self._on_job_ended)
         self._workers[job_id] = worker
         worker.start()
+        self._update_keys_button()
         self._refresh_detail()
 
     def _on_job_updated(self, job: object) -> None:
@@ -379,6 +402,7 @@ class MainWindow(QMainWindow):
         if worker is not None:
             worker.wait()
             worker.deleteLater()
+        self._update_keys_button()
         if message:
             self._notices[job_id] = message
         try:
@@ -426,6 +450,7 @@ class MainWindow(QMainWindow):
         self._startup_worker = worker
         self.statusBar().showMessage(MSG_STARTUP_CHECK, STATUS_TIMEOUT_MS)
         worker.start()
+        self._update_keys_button()
 
     def _on_startup_done(self, result: object) -> None:
         if not isinstance(result, StartupResult):
@@ -449,6 +474,7 @@ class MainWindow(QMainWindow):
         deferred, self._deferred = self._deferred, []
         for source, is_youtube in deferred:
             self._submit(source, is_youtube)
+        self._update_keys_button()
 
     def _start_retry(self) -> None:
         if self._retry_worker is not None or self._startup_worker is not None:
@@ -459,6 +485,7 @@ class MainWindow(QMainWindow):
         worker.finished.connect(self._on_retry_finished)
         self._retry_worker = worker
         worker.start()
+        self._update_keys_button()
 
     def _on_retry_done(self, _settled: object) -> None:
         self._reload_from_store()
@@ -469,6 +496,7 @@ class MainWindow(QMainWindow):
             worker.wait()
             worker.deleteLater()
         self._retry_worker = None
+        self._update_keys_button()
 
     def _on_background_failed(self, message: str) -> None:
         self.statusBar().showMessage(message, STATUS_TIMEOUT_MS)
@@ -478,12 +506,37 @@ class MainWindow(QMainWindow):
 
     # --- keys and closing -----------------------------------------------------------------------
 
-    def _on_keys(self) -> None:
+    def _keys_locked(self) -> bool:
+        """True while anything may be talking to Vast.ai with the current key.
+
+        Switching to a key for another Vast.ai account mid-job would make the destroy of the
+        running machine fail and leave it billing, so keys can only change when all is idle.
+        """
+        return (
+            bool(self._workers)
+            or self._startup_worker is not None
+            or self._retry_worker is not None
+        )
+
+    def _update_keys_button(self) -> None:
+        locked = self._keys_locked()
+        self.keys_button.setEnabled(not locked)
+        self.keys_button.setToolTip(KEYS_LOCKED_TOOLTIP if locked else KEYS_TOOLTIP)
+
+    def open_keys_dialog(self) -> None:
         if self._setup_dialog_factory is None:
             return
-        dialog = self._setup_dialog_factory(self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.statusBar().showMessage("Keys checked and saved.", STATUS_TIMEOUT_MS)
+        if self._keys_locked():  # guard the open path itself, not only the button
+            self.statusBar().showMessage(KEYS_LOCKED_TOOLTIP, STATUS_TIMEOUT_MS)
+            return
+        self._retry_timer.stop()  # no background Vast.ai call while the key may change
+        try:
+            dialog = self._setup_dialog_factory(self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.statusBar().showMessage("Keys checked and saved.", STATUS_TIMEOUT_MS)
+        finally:
+            if self._retry_timer.interval() > 0:
+                self._retry_timer.start()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.has_running_jobs() and not self._confirm_close():

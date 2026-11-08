@@ -1,7 +1,7 @@
 """One-time setup: the Vast.ai API key and the Hugging Face token, each checked before saving.
 
 Nothing is saved unless both checks pass. A key is never shown or logged: the fields are
-password fields and status lines show at most the last four characters.
+password fields and status lines never quote any part of a key.
 """
 
 import logging
@@ -24,7 +24,6 @@ from app.credentials import HF_TOKEN, VAST_API_KEY, CredentialError, CredentialS
 from app.gui import theme
 from app.gui.worker import TaskWorker, plain_error
 from app.hf_check import GATED_MODELS, HF_SITE, HfAccess
-from app.presenter import mask_secret
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +86,7 @@ def run_checks(
     )
 
 
-def _hf_message(token: str, access: HfAccess) -> tuple[bool, str]:
+def _hf_message(access: HfAccess) -> tuple[bool, str]:
     if not access.valid:
         return False, MSG_HF_REFUSED
     account = f" (account {access.user})" if access.user else ""
@@ -95,11 +94,17 @@ def _hf_message(token: str, access: HfAccess) -> tuple[bool, str]:
     if missing:
         names = ", ".join(missing)
         return False, (
-            f"Token {mask_secret(token)} works{account}, but the terms are not accepted on: "
-            f"{names}. Open each page while signed in to that account, accept the terms, "
-            "then try again."
+            f"This token works{account}, but the terms are not accepted on: {names}. Open each "
+            "page while signed in to that account, accept the terms, then try again."
         )
-    return True, f"Token {mask_secret(token)} works{account}; both models are accepted."
+    return True, f"This token works{account}; both models are accepted."
+
+
+def _credit_text(balance: float) -> str:
+    text = f"Credit on the account: ${balance:.2f}."
+    if balance <= 0:
+        text += " Add prepaid credit at cloud.vast.ai before starting a job."
+    return text
 
 
 class SetupDialog(QDialog):
@@ -174,6 +179,7 @@ class SetupDialog(QDialog):
     def _status_label() -> QLabel:
         label = QLabel()
         label.setWordWrap(True)
+        label.setTextFormat(Qt.TextFormat.PlainText)  # error text comes from servers
         label.hide()
         return label
 
@@ -237,34 +243,41 @@ class SetupDialog(QDialog):
     def _on_check_failed(self, message: str) -> None:
         self._set_status(self.form_status, message, theme.KIND_FAILED)
 
-    def _vast_result(self, outcome: CheckOutcome, key: str) -> bool:
+    def _credit_kind(self, balance: float) -> str:
+        return theme.KIND_CAP if balance <= 0 else theme.KIND_DONE
+
+    def _vast_result(self, outcome: CheckOutcome) -> bool:
         if outcome.balance is None:
             self._set_status(self.vast_status, outcome.vast_error or "", theme.KIND_FAILED)
             return False
-        text = f"Key {mask_secret(key)} works. Credit on the account: ${outcome.balance:.2f}."
-        if outcome.balance <= 0:
-            text += " Add prepaid credit at cloud.vast.ai before starting a job."
-            self._set_status(self.vast_status, text, theme.KIND_CAP)
-        else:
-            self._set_status(self.vast_status, text, theme.KIND_DONE)
+        text = f"This key works. {_credit_text(outcome.balance)}"
+        self._set_status(self.vast_status, text, self._credit_kind(outcome.balance))
         return True
 
-    def _hf_result(self, outcome: CheckOutcome, token: str) -> bool:
+    def _hf_result(self, outcome: CheckOutcome) -> bool:
         if outcome.hf_access is None:
             self._set_status(self.hf_status, outcome.hf_error or "", theme.KIND_FAILED)
             return False
-        ok, text = _hf_message(token, outcome.hf_access)
+        ok, text = _hf_message(outcome.hf_access)
         self._set_status(self.hf_status, text, theme.KIND_DONE if ok else theme.KIND_FAILED)
         return ok
+
+    def _show_saved(self, balance: float, access: HfAccess) -> None:
+        """No piece of a key is ever echoed: only "Saved", the credit and the account name."""
+        self._set_status(
+            self.vast_status, f"Saved. {_credit_text(balance)}", self._credit_kind(balance)
+        )
+        account = f" Hugging Face account: {access.user}." if access.user else ""
+        self._set_status(self.hf_status, f"Saved.{account}", theme.KIND_DONE)
 
     def _on_checked(self, outcome: object) -> None:
         if not isinstance(outcome, CheckOutcome):
             return
-        vast_key, hf_token = self._secrets
-        vast_ok = self._vast_result(outcome, vast_key)
-        hf_ok = self._hf_result(outcome, hf_token)
-        if not (vast_ok and hf_ok):
+        vast_ok = self._vast_result(outcome)
+        hf_ok = self._hf_result(outcome)
+        if not (vast_ok and hf_ok) or outcome.balance is None or outcome.hf_access is None:
             return
+        vast_key, hf_token = self._secrets
         try:
             self._creds.set(VAST_API_KEY, vast_key)
             self._creds.set(HF_TOKEN, hf_token)
@@ -272,5 +285,6 @@ class SetupDialog(QDialog):
             self._set_status(self.form_status, str(exc), theme.KIND_FAILED)
             return
         logger.info("Vast.ai key and Hugging Face token checked and saved")
+        self._show_saved(outcome.balance, outcome.hf_access)
         self.balance = outcome.balance
         self._saved = True

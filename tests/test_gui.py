@@ -10,6 +10,7 @@ from PySide6.QtGui import QDragEnterEvent, QDropEvent
 
 from app.credentials import CredentialStore
 from app.estimate import estimate_job, format_estimate
+from app.gui.job_detail import JobDetail
 from app.gui.main_window import MainWindow
 from app.gui.new_job_panel import ESTIMATE_PRICE_PER_HOUR, NewJobPanel
 from app.gui.setup_dialog import SetupDialog
@@ -76,7 +77,7 @@ def make_window(
 
 
 def test_play_disabled_until_input_is_valid(qtbot: object, tmp_path: Path) -> None:
-    panel = NewJobPanel(probe=None)
+    panel = NewJobPanel(probe=None, debounce_ms=0)
     qtbot.addWidget(panel)  # type: ignore[attr-defined]
     assert not panel.play_button.isEnabled()
     assert panel.play_button.toolTip() == "Paste a YouTube link or choose a file"
@@ -85,10 +86,75 @@ def test_play_disabled_until_input_is_valid(qtbot: object, tmp_path: Path) -> No
     assert panel.play_button.isEnabled()
 
     panel.source_edit.setText(str(write_audio(tmp_path)))
-    assert panel.play_button.isEnabled()
+    assert not panel.play_button.isEnabled()  # waits for the worker's file check
+    qtbot.waitUntil(panel.play_button.isEnabled, timeout=WAIT_MS)  # type: ignore[attr-defined]
 
     panel.source_edit.setText("")
     assert not panel.play_button.isEnabled()
+    qtbot.waitUntil(lambda: not panel.is_probing(), timeout=WAIT_MS)  # type: ignore[attr-defined]
+
+
+def test_unc_path_is_checked_off_the_ui_thread_and_play_waits(qtbot: object) -> None:
+    calls: list[tuple[str, int]] = []
+    release = threading.Event()
+
+    def slow_checker(path: str) -> bool:
+        calls.append((path, threading.get_ident()))
+        release.wait(5)  # a sleeping network drive
+        return True
+
+    unc = r"\\server\share\meeting.mp3"
+    panel = NewJobPanel(probe=None, debounce_ms=0, file_checker=slow_checker)
+    qtbot.addWidget(panel)  # type: ignore[attr-defined]
+    panel.source_edit.setText(unc)
+    assert not panel.play_button.isEnabled()
+    assert panel.estimate_label.text() == "Checking the file…"
+    qtbot.waitUntil(lambda: bool(calls), timeout=WAIT_MS)  # type: ignore[attr-defined]
+    assert not panel.play_button.isEnabled()
+    release.set()
+    qtbot.waitUntil(panel.play_button.isEnabled, timeout=WAIT_MS)  # type: ignore[attr-defined]
+    assert all(thread != threading.get_ident() for _path, thread in calls)
+    assert calls[0][0] == unc
+    qtbot.waitUntil(lambda: not panel.is_probing(), timeout=WAIT_MS)  # type: ignore[attr-defined]
+
+
+def test_missing_file_is_reported_by_the_worker(qtbot: object, tmp_path: Path) -> None:
+    panel = NewJobPanel(probe=None, debounce_ms=0)
+    qtbot.addWidget(panel)  # type: ignore[attr-defined]
+    panel.source_edit.setText(str(tmp_path / "nope.mp3"))
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: "find that file" in panel.error_label.text(), timeout=WAIT_MS
+    )
+    assert not panel.play_button.isEnabled()
+    qtbot.waitUntil(lambda: not panel.is_probing(), timeout=WAIT_MS)  # type: ignore[attr-defined]
+
+
+def test_typing_and_dragging_never_touch_the_filesystem_on_the_ui_thread(
+    qtbot: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ui_thread = threading.get_ident()
+    ui_calls: list[object] = []
+
+    def guarded(path: object) -> bool:
+        if threading.get_ident() == ui_thread:
+            ui_calls.append(path)
+        return False  # never reach for the (fake) network share
+
+    monkeypatch.setattr("os.path.isfile", guarded)
+    monkeypatch.setattr("os.path.exists", guarded)
+    panel = NewJobPanel(probe=None, debounce_ms=0)
+    qtbot.addWidget(panel)  # type: ignore[attr-defined]
+    panel.source_edit.setText(r"\\server\share\a.mp3")
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(r"\\server\share\b.mp3")])
+    enter = QDragEnterEvent(
+        QPointF(5, 5), Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )  # fmt: skip
+    panel.dragEnterEvent(enter)
+    assert enter.isAccepted()
+    qtbot.waitUntil(lambda: not panel.is_probing(), timeout=WAIT_MS)  # type: ignore[attr-defined]
+    assert ui_calls == []
 
 
 def test_playlist_link_keeps_play_disabled_with_plain_error(qtbot: object) -> None:
@@ -98,6 +164,7 @@ def test_playlist_link_keeps_play_disabled_with_plain_error(qtbot: object) -> No
     assert not panel.play_button.isEnabled()
     assert "single video" in panel.error_label.text()
     assert not panel.error_label.isHidden()
+    assert panel.error_label.textFormat() == Qt.TextFormat.PlainText
 
 
 def test_play_emits_source(qtbot: object) -> None:
@@ -110,7 +177,7 @@ def test_play_emits_source(qtbot: object) -> None:
 
 
 def test_drag_and_drop_file_sets_source(qtbot: object, tmp_path: Path) -> None:
-    panel = NewJobPanel(probe=None)
+    panel = NewJobPanel(probe=None, debounce_ms=0)
     qtbot.addWidget(panel)  # type: ignore[attr-defined]
     audio = write_audio(tmp_path, "dropped.wav")
     mime = QMimeData()
@@ -129,7 +196,8 @@ def test_drag_and_drop_file_sets_source(qtbot: object, tmp_path: Path) -> None:
     )  # fmt: skip
     panel.dropEvent(drop)
     assert Path(panel.source_edit.text()) == audio
-    assert panel.play_button.isEnabled()
+    qtbot.waitUntil(panel.play_button.isEnabled, timeout=WAIT_MS)  # type: ignore[attr-defined]
+    qtbot.waitUntil(lambda: not panel.is_probing(), timeout=WAIT_MS)  # type: ignore[attr-defined]
 
 
 def test_drag_of_a_web_url_is_refused(qtbot: object) -> None:
@@ -375,6 +443,99 @@ def test_alarm_shown_for_final_job_with_machine(
     assert alarm.isVisible()
     assert "4242" in alarm.text()
     assert "cloud.vast.ai" in alarm.text()
+
+
+HTML_NAME = '<b>x</b><a href="https://evil">click</a>'
+
+
+def test_job_text_is_shown_as_plain_text_not_html(
+    make_window: Callable[..., MainWindow], store: JobStore
+) -> None:
+    store.save(
+        make_job(
+            "html", name=HTML_NAME, state=JobState.FAILED, source="<i>src</i>",
+            message="<img src=x>", error="<h1>boom</h1>",
+        )
+    )  # fmt: skip
+    window = make_window()
+    item = window.job_item("html")
+    assert item.name_label.textFormat() == Qt.TextFormat.PlainText
+    assert item.name_label.text() == HTML_NAME
+    assert item.summary_label.textFormat() == Qt.TextFormat.PlainText
+    assert "<b>" not in item.name_label.toolTip()  # escaped, so shown literally
+    window.select_job("html")
+    detail = window.job_detail
+    for label, text in (
+        (detail.title_label, HTML_NAME),
+        (detail.source_label, "<i>src</i>"),
+        (detail.message_label, "<h1>boom</h1>"),
+    ):
+        assert label.textFormat() == Qt.TextFormat.PlainText
+        assert label.text() == text
+    for label in (detail.status_label, detail.alarm_label, detail.notice_label, detail.cost_label):
+        assert label.textFormat() == Qt.TextFormat.PlainText
+    assert all(text.textFormat() == Qt.TextFormat.PlainText for text in detail.stage_text_labels())
+
+
+class FakeDialog:
+    def __init__(self, opened: list[bool]) -> None:
+        self._opened = opened
+
+    def exec(self) -> int:
+        self._opened.append(True)
+        return 0
+
+
+def test_keys_button_is_disabled_while_a_job_runs(
+    qtbot: object, make_window: Callable[..., MainWindow], orch: FakeOrchestrator
+) -> None:
+    orch.block = True
+    opened: list[bool] = []
+    window = make_window(setup_dialog_factory=lambda parent: FakeDialog(opened))
+    assert window.keys_button.isEnabled()
+    window.new_job_panel.source_edit.setText(YOUTUBE)
+    window.new_job_panel.play_button.click()
+    assert orch.started.wait(5)
+    assert not window.keys_button.isEnabled()
+    assert window.keys_button.toolTip() == "Finish or cancel running jobs before changing keys"
+    window.open_keys_dialog()  # the open path is guarded too, not only the button
+    assert opened == []
+    orch.release.set()
+    qtbot.waitUntil(lambda: not window.has_running_jobs(), timeout=WAIT_MS)  # type: ignore[attr-defined]
+    assert window.keys_button.isEnabled()
+    window.open_keys_dialog()
+    assert opened == [True]
+
+
+def test_keys_button_is_disabled_during_the_startup_check(
+    qtbot: object, make_window: Callable[..., MainWindow], orch: FakeOrchestrator
+) -> None:
+    orch.hold_startup = True
+    opened: list[bool] = []
+    window = make_window(run_startup=True, setup_dialog_factory=lambda parent: FakeDialog(opened))
+    assert not window.keys_button.isEnabled()
+    window.open_keys_dialog()
+    assert opened == []
+    orch.startup_gate.set()
+    qtbot.waitUntil(lambda: not window.has_background_work(), timeout=WAIT_MS)  # type: ignore[attr-defined]
+    assert window.keys_button.isEnabled()
+
+
+def test_cancelling_state_survives_job_updates(qtbot: object) -> None:
+    detail = JobDetail(opener=lambda path: None)
+    qtbot.addWidget(detail)  # type: ignore[attr-defined]
+    detail.show()
+    running = make_job("c", state=JobState.LABELING, chunk=1, chunks=4, percent=10)
+    detail.show_job(running, running=True)
+    with qtbot.waitSignal(detail.cancel_requested, timeout=WAIT_MS):  # type: ignore[attr-defined]
+        detail.cancel_button.click()
+    detail.show_job(running.with_(percent=20, chunk=2), running=True)
+    assert not detail.cancel_button.isEnabled()
+    assert detail.status_label.text().startswith("Cancelling")
+    detail.show_job(running.with_(state=JobState.CANCELLED), running=False)
+    assert detail.status_label.text() == "Cancelled"
+    detail.show_job(make_job("c", state=JobState.LABELING), running=True)  # e.g. a later rerun
+    assert detail.cancel_button.isEnabled()
 
 
 def test_no_alarm_for_ordinary_failed_job(

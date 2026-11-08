@@ -10,7 +10,6 @@ from app.presenter import (
     alarm_text,
     check_source,
     cost_text,
-    mask_secret,
     stage_rows,
     status_kind,
     suggested_cap,
@@ -155,23 +154,35 @@ def test_check_source_playlist_link_gives_plain_error() -> None:
     assert "single video" in result.error
 
 
-def test_check_source_existing_file_with_quotes(tmp_path: Path) -> None:
+def test_check_source_path_needs_a_file_check_and_strips_quotes(tmp_path: Path) -> None:
     audio = tmp_path / "talk.mp3"
-    audio.write_bytes(b"x")
     result = check_source(f'"{audio}"')
-    assert result.ok
+    assert not result.ok  # Play waits for the worker's file check
+    assert result.needs_file_check
     assert not result.is_youtube
+    assert result.error is None
     assert result.source == str(audio)
 
 
-def test_check_source_missing_file(tmp_path: Path) -> None:
-    result = check_source(str(tmp_path / "nope.mp3"))
+def test_check_source_never_touches_the_filesystem(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden(*_args: object) -> bool:
+        raise AssertionError("check_source must not touch the filesystem")
+
+    monkeypatch.setattr("os.path.isfile", forbidden)
+    monkeypatch.setattr("os.path.exists", forbidden)
+    monkeypatch.setattr("os.path.isdir", forbidden)
+    for text in (r"\\server\share\talk.mp3", "//server/share/talk.mp3", r"Z:\talk.mp3"):
+        result = check_source(text)
+        assert result.needs_file_check
+        assert not result.ok
+
+
+def test_check_source_plain_word_is_not_a_path() -> None:
+    result = check_source("hello")
     assert not result.ok
+    assert not result.needs_file_check
     assert result.error is not None
-    assert "find that file" in result.error
 
 
-def test_mask_secret_hides_all_but_last_four() -> None:
-    assert mask_secret("abcdefghijklmnop") == "••••mnop"
-    assert mask_secret("short") == "••••"
-    assert "abcdefgh" not in mask_secret("abcdefghijklmnop")
+def test_links_need_no_file_check() -> None:
+    assert not check_source("https://youtu.be/abc").needs_file_check

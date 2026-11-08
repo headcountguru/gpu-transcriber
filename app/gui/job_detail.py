@@ -39,6 +39,7 @@ TRANSCRIPT_FILE = "transcript.txt"
 TIMESTAMPED_FILE = "transcript_timestamped.txt"
 SUBTITLES_FILE = "transcript.srt"
 STAGE_COUNT = 6
+CANCELLING_TEXT = "Cancelling — shutting the machine down…"
 MAX_CAP_DOLLARS = 1000.0
 
 _STAGE_KIND = {
@@ -53,6 +54,9 @@ Opener = Callable[[str], None]
 
 def _label(object_name: str = "", text: str = "", wrap: bool = True) -> QLabel:
     label = QLabel(text)
+    # Job names, sources and messages come from YouTube titles, files and the remote machine:
+    # never let Qt guess they are rich text (a title could otherwise render links or markup).
+    label.setTextFormat(Qt.TextFormat.PlainText)
     if object_name:
         label.setObjectName(object_name)
     label.setWordWrap(wrap)
@@ -71,6 +75,7 @@ class JobDetail(QWidget):
         self._opener = opener
         self._job: Job | None = None
         self._stage_status: dict[str, str] = {}
+        self._cancelling: set[str] = set()
         self._stack = QStackedLayout(self)
         self._stack.addWidget(self._build_empty())
         self._stack.addWidget(self._build_content())
@@ -201,6 +206,8 @@ class JobDetail(QWidget):
             self._stack.setCurrentIndex(0)
             return
         self._stack.setCurrentIndex(1)
+        if job.state in TERMINAL_STATES:
+            self._cancelling.discard(job.id)
         self._show_header(job)
         self._show_progress(job)
         self._show_stages(job)
@@ -214,7 +221,8 @@ class JobDetail(QWidget):
 
     def _show_header(self, job: Job) -> None:
         self.title_label.setText(job.name)
-        self.status_label.setText(summary_line(job))
+        cancelling = job.id in self._cancelling
+        self.status_label.setText(CANCELLING_TEXT if cancelling else summary_line(job))
         theme.set_kind(self.status_label, status_kind(job))
         self.source_label.setText(job.source)
         alarm = alarm_text(job)
@@ -249,12 +257,15 @@ class JobDetail(QWidget):
 
     def _show_buttons(self, job: Job, running: bool) -> None:
         self.cancel_button.setVisible(running and job.state not in TERMINAL_STATES)
-        self.cancel_button.setEnabled(True)
+        self.cancel_button.setEnabled(job.id not in self._cancelling)
         self.raise_cap_button.setVisible(job.state is JobState.STOPPED_AT_CAP and not running)
         has_outputs = job.state is JobState.DONE and bool(job.output_dir)
         self.outputs_title.setVisible(has_outputs)
         for button in self._output_buttons():
             button.setVisible(has_outputs)
+
+    def stage_text_labels(self) -> list[QLabel]:
+        return list(self._stage_labels)
 
     def stage_texts(self) -> list[str]:
         return [label.text() for label in self._stage_labels]
@@ -267,8 +278,9 @@ class JobDetail(QWidget):
     def _on_cancel(self) -> None:
         if self._job is None:
             return
+        self._cancelling.add(self._job.id)  # kept until the job reaches a final state
         self.cancel_button.setEnabled(False)
-        self.status_label.setText("Cancelling — shutting the machine down…")
+        self.status_label.setText(CANCELLING_TEXT)
         self.cancel_requested.emit(self._job.id)
 
     def _on_raise_cap(self) -> None:
