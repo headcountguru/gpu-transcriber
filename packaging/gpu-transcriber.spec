@@ -27,7 +27,9 @@ hiddenimports = (
     + collect_submodules("cryptography.hazmat.primitives.asymmetric")
 )
 
-# Heavy or unrelated packages the app never imports (checked against app/ and common/).
+# Packages the app never imports (checked against app/ and common/), kept out of the analysis.
+# This does not make the folder smaller: PySide6's PyInstaller hook still ships the Qt DLLs
+# (Qt6Network, Qt6Qml, ...) and the ffmpeg binary alone is about 100 MB of the total.
 excludes = [
     "tkinter",
     "matplotlib",

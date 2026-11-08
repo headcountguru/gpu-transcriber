@@ -160,8 +160,26 @@ def keys_present(creds: CredentialStore) -> bool:
         return False
 
 
+def keyring_usable(get_backend: Callable[[], object] | None = None) -> bool:
+    """True if keyring found a real secure-storage backend (its ``fail`` backend means none).
+
+    Only asks keyring which backend it would use; it never reads or writes a credential.
+    """
+    try:
+        from keyring.backends import fail
+
+        if get_backend is None:
+            import keyring
+
+            get_backend = keyring.get_keyring
+        return not isinstance(get_backend(), fail.Keyring)
+    except Exception as exc:  # a missing package or backend must fail the self-test, not crash it
+        logger.error("Secure storage check failed (%s)", type(exc).__name__)
+        return False
+
+
 def selftest() -> int:
-    """Import everything, build the Qt application offscreen (no window), check ffmpeg."""
+    """Import everything, build the Qt app offscreen (no window), check ffmpeg and keyring."""
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
 
@@ -173,6 +191,9 @@ def selftest() -> int:
     ffmpeg = Path(ffmpeg_path())
     if not ffmpeg.is_file():
         logger.error("Self-test failed: ffmpeg was not found at %s", ffmpeg)
+        return 1
+    if not keyring_usable():
+        logger.error("Self-test failed: no secure storage (Windows Credential Manager) backend")
         return 1
     logger.info("Self-test passed (Qt %s, ffmpeg %s)", application.applicationName(), ffmpeg)
     return 0

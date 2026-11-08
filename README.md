@@ -37,8 +37,10 @@ Do these steps in order. You only do them once.
      - https://huggingface.co/pyannote/speaker-diarization-3.1
      - https://huggingface.co/pyannote/segmentation-3.0
 5. **Install and start the app.**
-   - Windows build: run `gpu-transcriber.exe` from the `gpu-transcriber` folder
-     (see "For developers" to build it).
+   - Windows build: the build makes a folder named `dist\gpu-transcriber`
+     (see "For developers" to build it). You can copy that whole folder anywhere.
+     Start the app by double-clicking `gpu-transcriber.exe` inside it.
+     Keep the exe together with the other files in the folder.
    - From source: `python -m app.main`.
 
    The first start shows a setup window. Paste both keys. The app checks both before it saves
@@ -66,9 +68,17 @@ and never less than $1.00. The job shows its cost so far against the cap. If the
 cap, the job stops and the machine is destroyed. Press **Raise cap and continue** to set a higher
 cap and carry on from where it stopped.
 
+The cap is not exact. The final cost can pass it by a few minutes of rental. Connecting to a new
+machine can retry for up to about 5 minutes. Confirming that the machine is destroyed can take
+up to about 100 seconds. After a rental whose result is unclear, the app looks for the machine
+for up to 3 minutes. The app cannot always stop during these waits.
+
 **If you close the app during a job.** The app asks you to confirm first. The machine keeps going
 until the job ends or its own safety timer destroys it. Open the app again to continue.
-If the machine failed while the app was closed, the job is run again on a new machine.
+If the machine is gone when you reopen the app, the job shows as failed
+("The machine was lost while the app was closed."). Start the job again from the beginning.
+The app only rents a replacement machine by itself when the machine is lost while the app is
+open, and then it tries a limited number of times.
 
 **"A machine may still be running".** This warning means the app could not confirm that a machine
 was destroyed. The warning shows the machine's id, and the app keeps trying to remove it.
@@ -98,8 +108,13 @@ measured yet.** Treat the estimate and the default cap as a guess until a long r
 - The Hugging Face "terms accepted" check has not been tried with a real account that accepted
   the terms.
 - Real YouTube downloads with `yt-dlp.exe` have not been tested live.
-- The Windows build was only self-tested (it starts and finds ffmpeg). It has not been taken
-  through a full job by hand.
+- The Windows build was only self-tested (it starts, finds ffmpeg and finds a secure-storage
+  backend). It has not been taken through a full job by hand.
+- In the Windows build, saving and reading keys in Credential Manager was not tried. Only an
+  8-second launch was done.
+- The setup window in the Windows build was not looked at or used.
+- What happens when a machine is lost while the app is open (the app rents a replacement) has
+  not been tried on a real machine.
 
 ## Troubleshooting
 
@@ -116,8 +131,9 @@ measured yet.** Treat the estimate and the default cap as a guess until a long r
 | "A machine may still be running" | See the section above. Check cloud.vast.ai and destroy it by hand if needed. |
 
 **Logs** are in `%APPDATA%\GpuTranscriber\logs\gpu_transcriber.log`. Keys are never written
-to the log. The helper `yt-dlp.exe` is kept in `%APPDATA%\GpuTranscriber\tools` and the app
-checks for an update about once a day.
+to the log. The helper `yt-dlp.exe` is kept in `%APPDATA%\GpuTranscriber\tools`. The app does
+not update it on a schedule. When a YouTube download fails, the app updates `yt-dlp.exe` and tries
+once more. It does this at most once every 24 hours.
 
 ## For developers
 

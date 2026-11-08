@@ -21,6 +21,31 @@ def test_selftest_exits_zero() -> None:
     assert app_main.main(["--selftest"]) == 0
 
 
+def test_keyring_usable_accepts_a_real_backend() -> None:
+    assert app_main.keyring_usable(lambda: FakeBackend()) is True
+
+
+def test_keyring_usable_rejects_the_fail_backend() -> None:
+    from keyring.backends import fail
+
+    assert app_main.keyring_usable(fail.Keyring) is False
+
+
+def test_keyring_usable_rejects_a_lookup_that_raises() -> None:
+    def broken() -> object:
+        raise RuntimeError("no backend")
+
+    assert app_main.keyring_usable(broken) is False
+
+
+def test_selftest_fails_when_secure_storage_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app_main, "keyring_usable", lambda: False)
+
+    assert app_main.main(["--selftest"]) == 1
+
+
 def test_prepare_youtube_job_goes_to_its_audio_folder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
