@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 from app.estimate import estimate_job, format_estimate
 from app.gui import theme
 from app.gui.worker import TaskWorker, plain_error
-from app.media_prep import MSG_MISSING, MediaPrepError
+from app.media_prep import MSG_MISSING, MediaPrepError, UnknownLengthError
 from app.presenter import SourceCheck, check_source
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,7 @@ ESTIMATE_NOTE = (
     "confirmed for long recordings. A spending cap is set automatically."
 )
 CHECKING_TEXT = "Checking the length…"
+MSG_LENGTH_UNKNOWN = "Length unknown, so there is no estimate. You can still press Play."
 FILE_FILTER = (
     "Audio or video files (*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.opus *.wma *.mp4 *.mkv "
     "*.mov *.avi *.webm);;All files (*)"
@@ -66,6 +67,7 @@ class ProbeOutcome:
 
     duration_s: float | None
     error: str | None
+    length_unknown: bool = False  # readable, but no length in the header: no estimate
 
 
 def check_and_probe(
@@ -82,6 +84,8 @@ def check_and_probe(
         return ProbeOutcome(duration_s=None, error=None)
     try:
         return ProbeOutcome(duration_s=float(probe(source, is_youtube)), error=None)
+    except UnknownLengthError:
+        return ProbeOutcome(duration_s=None, error=None, length_unknown=True)
     except Exception as exc:
         logger.warning("Length check failed (%s)", type(exc).__name__)
         return ProbeOutcome(duration_s=None, error=plain_error(exc))
@@ -284,6 +288,12 @@ class NewJobPanel(QWidget):
         if self._check.needs_file_check:
             self._confirmed = self._key(self._check)
             self._refresh_play()
+        if outcome.length_unknown:
+            self.estimate_label.setText(MSG_LENGTH_UNKNOWN)
+            theme.set_kind(self.estimate_label, "")
+            self.estimate_label.show()
+            self.estimate_note.hide()
+            return
         if outcome.duration_s is None:
             self._hide_estimate()
             self._show_error(outcome.error)

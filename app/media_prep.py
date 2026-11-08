@@ -35,6 +35,7 @@ RESERVED_NAMES = frozenset(
 
 _ILLEGAL_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 _DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+_NO_DURATION_RE = re.compile(r"Duration:\s*N/A")
 _YOUTUBE_SHORT_HOST = "youtu.be"
 _YOUTUBE_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"})
 _VIDEO_PATH_KINDS = frozenset({"shorts", "live", "embed"})
@@ -67,6 +68,9 @@ MSG_NOT_A_VIDEO = "That link isn't a video that can be downloaded."
 MSG_DOWNLOAD_FAILED = "Could not download the audio from that link."
 MSG_DOWNLOAD_EMPTY = "The download finished but no audio came through."
 MSG_TIMEOUT = "That took too long and was stopped. Please try again."
+MSG_LENGTH_UNKNOWN = (
+    "We can't tell how long this file is, so there is no estimate. You can still start the job."
+)
 MSG_NO_LENGTH = (
     "Could not find out how long that video is. It may be a live stream, which can't be "
     "transcribed."
@@ -114,6 +118,10 @@ Run = Callable[..., Any]
 
 class MediaPrepError(RuntimeError):
     """Preparing the audio failed. The message is plain words for a non-technical user."""
+
+
+class UnknownLengthError(MediaPrepError):
+    """The file is readable but its header has no length, so no estimate can be made."""
 
 
 @dataclass(frozen=True)
@@ -202,17 +210,28 @@ def _parse_duration(stderr: str) -> float | None:
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
-def _probe_media(path: Path, ffmpeg_exe: str, run: Run) -> float:
-    """Length in seconds from ffmpeg's header; raises if there is no readable audio."""
+def _probe_media(path: Path, ffmpeg_exe: str, run: Run) -> float | None:
+    """Length in seconds from ffmpeg's header; raises if there is no readable audio.
+
+    None means the header says ``Duration: N/A`` (some files, e.g. browser-recorded .webm,
+    carry no length): the audio is readable, only its length is not known up front.
+    """
     result = _run_tool(run, [ffmpeg_exe, "-hide_banner", "-i", str(path)], FFMPEG_PROBE_TIMEOUT_S)
     header = result.stderr or ""
     duration = _parse_duration(header)
-    if duration is None:
+    if duration is None and _NO_DURATION_RE.search(header) is None:
         raise MediaPrepError(_classify(header, _FFMPEG_PROBLEMS, MSG_UNREADABLE))
     if " Audio:" not in header:
         raise MediaPrepError(MSG_NO_AUDIO)
-    if duration <= 0:
+    if duration is not None and duration <= 0:
         raise MediaPrepError(MSG_EMPTY)
+    return duration
+
+
+def _probe_known_length(path: Path, ffmpeg_exe: str, run: Run) -> float:
+    duration = _probe_media(path, ffmpeg_exe, run)
+    if duration is None:
+        raise UnknownLengthError(MSG_LENGTH_UNKNOWN)
     return duration
 
 
@@ -225,7 +244,7 @@ def _compress(source: Path, work_dir: Path, ffmpeg_exe: str, title: str, run: Ru
         logger.warning("ffmpeg conversion failed (exit %s)", result.returncode)
         raise MediaPrepError(_classify(result.stderr or "", _FFMPEG_PROBLEMS, MSG_CONVERT_FAILED))
     try:
-        duration = _probe_media(target, ffmpeg_exe, run)
+        duration = _probe_known_length(target, ffmpeg_exe, run)  # the encoded file has one
     except MediaPrepError:
         target.unlink(missing_ok=True)
         raise
@@ -237,7 +256,10 @@ def _compress(source: Path, work_dir: Path, ffmpeg_exe: str, title: str, run: Ru
 def prepare_file(
     source: Path, work_dir: Path, ffmpeg_exe: str, *, run: Run = subprocess.run
 ) -> PreparedAudio:
-    """Compress a local audio or video file to ``work_dir/audio.opus``."""
+    """Compress a local audio or video file to ``work_dir/audio.opus``.
+
+    A source without a length in its header is fine: the length is measured on the output.
+    """
     _check_source(source)
     _probe_media(source, ffmpeg_exe, run)
     return _compress(source, work_dir, ffmpeg_exe, source.stem, run)
@@ -372,11 +394,15 @@ def probe_duration_s(
     *,
     run: Run = subprocess.run,
 ) -> float:
-    """Length of a recording in seconds, without downloading or converting it."""
+    """Length of a recording in seconds, without downloading or converting it.
+
+    Raises ``UnknownLengthError`` (a ``MediaPrepError``) for a readable file whose header has
+    no length: there is then no estimate, but the file can still be transcribed.
+    """
     if not is_youtube:
         path = Path(source)
         _check_source(path)
-        return _probe_media(path, ffmpeg_exe, run)
+        return _probe_known_length(path, ffmpeg_exe, run)
     link = _check_youtube_url(source)
     command = _ytdlp_base(ytdlp_exe, ffmpeg_exe, cookies_file) + [
         "--skip-download", "--print", "duration", link,
