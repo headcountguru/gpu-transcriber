@@ -73,8 +73,14 @@ machine can retry for up to about 5 minutes. Confirming that the machine is dest
 up to about 100 seconds. After a rental whose result is unclear, the app looks for the machine
 for up to 3 minutes. The app cannot always stop during these waits.
 
-**If you close the app during a job.** The app asks you to confirm first. The machine keeps going
-until the job ends or its own safety timer destroys it. Open the app again to continue.
+**If you close the app during a job.** The app asks you to confirm first. With the app closed,
+the rented machine keeps running and charging (usually about $0.20-$0.60 an hour) until the job
+finishes. After it finishes, the machine waits up to 3 hours for the app to come back and download
+the results, and it keeps charging while it waits. The machine's own safety timer shuts it down
+once its time limit is reached (at least 3 hours, longer for long recordings). The spending cap
+is enforced only while the app is open. Reopen the app to download your results and shut the
+machine down.
+
 If the machine is gone when you reopen the app, the job shows as failed
 ("The machine was lost while the app was closed."). Start the job again from the beginning.
 The app only rents a replacement machine by itself when the machine is lost while the app is
@@ -127,6 +133,7 @@ measured yet.** Treat the estimate and the default cap as a guess until a long r
 | "Hugging Face did not accept this token" | Copy the whole token again. It must be a Read token. |
 | "That video is unavailable" | The video is private, removed, or blocked in your country. |
 | "That video is a live stream" | Wait until the stream has ended. |
+| "YouTube is asking for a sign-in before it will share this video" | The video is age-restricted, members-only or otherwise needs a YouTube sign-in, and the app can't sign in to YouTube. Download the video another way, then choose the audio or video file in the app instead of pasting the link. |
 | A link that is not one video | Playlists and channels are not supported. Paste a link to one video. |
 | "A machine may still be running" | See the section above. Check cloud.vast.ai and destroy it by hand if needed. |
 

@@ -90,7 +90,7 @@ LOCAL_OUTPUT_DIR = "output"
 REMOTE_SPEC_NAME = "remote_job.json"  # local copy of the job.json sent to the machine
 
 MSG_NO_OFFER = "No suitable machine is available right now. Nothing was rented. Try again later."
-MSG_NO_TOKEN = "Add your Hugging Face token in Settings before starting a job."
+MSG_NO_TOKEN = 'Add your Hugging Face token under "Accounts and keys…" before starting a job.'
 MSG_CANCELLED = "Cancelled. Nothing more will be charged for this job."
 MSG_DONE = "Done. The transcript is saved."
 MSG_ALREADY_RUNNING = "This job is already running."

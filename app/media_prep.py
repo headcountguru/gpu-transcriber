@@ -58,8 +58,9 @@ MSG_UNAVAILABLE = (
 )
 MSG_LIVE = "That video is a live stream, which can't be transcribed. Try again once it has ended."
 MSG_SIGN_IN = (
-    "YouTube is asking for a sign-in before it will share this video. "
-    "Add your YouTube cookies in Settings and try again."
+    "YouTube is asking for a sign-in before it will share this video (for example an "
+    "age-restricted or members-only video), and this app can't sign in to YouTube. "
+    "Download the video another way, then choose the audio or video file instead of the link."
 )
 MSG_NETWORK = "Could not reach YouTube. Check your internet connection and try again."
 MSG_NOT_A_VIDEO = "That link isn't a video that can be downloaded."

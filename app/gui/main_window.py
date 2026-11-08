@@ -38,6 +38,7 @@ from app.gui.new_job_panel import NewJobPanel, Probe
 from app.gui.worker import JobWorker, TaskWorker, plain_error
 from app.jobs import Job, JobStore
 from app.presenter import alarm_text, status_kind, summary_line
+from common.protocol import GRACE_AFTER_FINISH_S
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +49,14 @@ MIN_WIDTH = 900
 MIN_HEIGHT = 600
 STATUS_TIMEOUT_MS = 0  # keep messages until replaced
 CLOSE_TITLE = "A job is still running"
+_GRACE_HOURS = f"{GRACE_AFTER_FINISH_S / 3600:.0f} hours"
 CLOSE_TEXT = (
-    "A job is still running. If you close the app now, the machine keeps running until the job "
-    "ends or the safety timer destroys it; reopen the app to continue. Close anyway?"
+    "A job is still running. If you close the app now, the rented machine keeps running and "
+    "charging (usually about $0.20-$0.60 an hour) until the job finishes. After that it waits "
+    f"up to {_GRACE_HOURS} for the app to come back and download the results, and keeps "
+    "charging while it waits. Its safety timer shuts it down after its time limit (at least "
+    f"{_GRACE_HOURS}). The spending cap is enforced only while the app is open. "
+    "Reopen the app to download your results and shut the machine down. Close anyway?"
 )
 MSG_STARTUP_CHECK = "Checking for unfinished jobs and leftover machines…"
 MSG_WAITING_FOR_STARTUP = "The job will start as soon as the startup check finishes."
