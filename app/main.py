@@ -235,7 +235,7 @@ def run_app(data_dir: Path) -> int:
 
     application = QApplication(sys.argv[:1])
     application.setApplicationName("GPU Transcriber")
-    application.setStyleSheet(theme.STYLESHEET)
+    theme.apply_theme(application)
     creds = CredentialStore()
 
     def make_setup(parent: QWidget | None) -> QDialog:
