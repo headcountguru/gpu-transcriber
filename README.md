@@ -68,10 +68,13 @@ and never less than $1.00. The job shows its cost so far against the cap. If the
 cap, the job stops and the machine is destroyed. Press **Raise cap and continue** to set a higher
 cap and carry on from where it stopped.
 
-The cap is not exact. The final cost can pass it by a few minutes of rental. Connecting to a new
-machine can retry for up to about 5 minutes. Confirming that the machine is destroyed can take
-up to about 100 seconds. After a rental whose result is unclear, the app looks for the machine
-for up to 3 minutes. The app cannot always stop during these waits.
+The cap is not exact. The final cost can pass it by a few minutes of rental. Confirming that the
+machine is destroyed can take up to about 100 seconds. After a rental whose result is unclear,
+the app looks for the machine for up to 3 minutes. The app cannot always stop during these waits.
+
+If the machine stops reporting progress (the transcription crashed or the machine hung), the app
+stops the job after about 15 to 20 minutes, keeps the finished parts and shuts the machine down,
+instead of letting it run up to the cap.
 
 **If you close the app during a job.** The app asks you to confirm first. With the app closed,
 the rented machine keeps running and charging (usually about $0.20-$0.60 an hour) until the job
@@ -107,6 +110,10 @@ The estimate shown before Play is deliberately cautious. It uses constants for a
 measured yet.** Treat the estimate and the default cap as a guess until a long run has been done.
 
 ## What is not verified yet
+
+- Stopping a job whose machine stopped reporting needs a machine image built from this version
+  (it sends a regular "still alive" signal). Until the image is rebuilt, only a transcription that
+  never starts reporting is caught; one that stops halfway runs on until the spending cap.
 
 - The machine's self-destruct safety timer has not been tested on a real machine. The check for
   it (`--verify-self-destroy` in `scripts/live_smoke.py`) has not been run.
