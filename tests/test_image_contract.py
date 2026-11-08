@@ -11,6 +11,7 @@ import shutil
 import subprocess
 
 import pytest
+from _pipcheck import blocking_pip_check_lines
 
 IMAGE = os.environ.get("GPU_TRANSCRIBER_TEST_IMAGE", "")
 
@@ -81,7 +82,21 @@ def test_torchaudio_imports():
 
 
 def test_installed_packages_are_consistent():
-    _assert_ok(run_in_image(IMAGE, _PIP.format(args=", 'check'")))
+    result = run_in_image(IMAGE, _PIP.format(args=", 'check'"))
+    problems = blocking_pip_check_lines(f"{result.stdout}\n{result.stderr}")
+    assert result.returncode in (0, 1), f"pip check crashed:\n{result.stderr}"
+    assert not problems, "pip check found problems:\n" + "\n".join(problems)
+
+
+def test_torch_stack_is_the_base_image_build():
+    # pip once replaced these with a CUDA 13 build that rented machines' drivers may not support.
+    code = (
+        "import torch, torchaudio\n"
+        "assert torch.__version__.split('+')[0] == '2.5.1', torch.__version__\n"
+        "assert torchaudio.__version__.split('+')[0] == '2.5.1', torchaudio.__version__\n"
+        "assert torch.version.cuda == '12.4', torch.version.cuda\n"
+    )
+    _assert_ok(run_in_image(IMAGE, code))
 
 
 def test_torchvision_is_absent():

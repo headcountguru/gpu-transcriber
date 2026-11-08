@@ -34,7 +34,9 @@ Public. (Optionally link the package to the repo on the same page.)
 1. From the green run, download the `pip-freeze` artifact (`pip-freeze.txt`).
 2. Copy the versions of the packages listed in `requirements.txt` (and their dependencies if you want
    full reproducibility) from it into `docker/requirements.txt`. Do not add torch, torchaudio or
-   torchvision; they come from the base image.
+   torchvision; they come from the base image. `docker/constraints.txt` pins torch and torchaudio
+   to the base image's 2.5.1 so pip cannot upgrade them (the first build failed that way); change it
+   together with the base image tag, never alone.
 3. Commit, run the workflow again, and use the new digest.
 
 ## Use the digest in the app

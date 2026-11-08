@@ -17,11 +17,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # torchvision ships in the base image but nothing here needs it, and a mismatch with torch breaks
-# imports. Remove it before the requirements are resolved.
+# imports. Remove it before the requirements are resolved. The constraints keep pip from replacing
+# the base image's torch and torchaudio (see docker/constraints.txt).
 COPY docker/requirements.txt /tmp/requirements.txt
+COPY docker/constraints.txt /tmp/constraints.txt
 RUN pip uninstall -y torchvision \
-    && pip install -r /tmp/requirements.txt \
-    && rm /tmp/requirements.txt
+    && pip install -c /tmp/constraints.txt -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt /tmp/constraints.txt
 
 # pyannote.audio 3.4.0 still passes use_auth_token, which huggingface_hub no longer accepts.
 # The script exits non-zero (failing the build) if it patches no files.

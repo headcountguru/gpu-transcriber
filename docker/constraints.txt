@@ -1,0 +1,8 @@
+# Pip constraints for the rented-GPU container image (see docker/Dockerfile).
+# torch and torchaudio come from the base image (pytorch/pytorch:2.5.1-cuda12.4-...). Without these
+# pins, resolving pyannote.audio's dependencies upgraded torch to a CUDA 13 build and torchaudio to a
+# release that no longer has `AudioMetaData`, which pyannote.audio 3.4.0 needs. A constraint only
+# limits what pip may pick; it does not install anything. `==2.5.1` also matches the base image's
+# local version `2.5.1+cu124`.
+torch==2.5.1
+torchaudio==2.5.1

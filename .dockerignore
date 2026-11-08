@@ -1,4 +1,5 @@
-# The image needs only docker/requirements.txt, docker/patch_pyannote.py, common/ and remote/.
+# The image needs only docker/requirements.txt, docker/constraints.txt, docker/patch_pyannote.py,
+# common/ and remote/.
 .git
 .github
 .venv
