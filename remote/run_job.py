@@ -13,6 +13,7 @@ import argparse
 import logging
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -27,6 +28,7 @@ from common.protocol import (
     JOB_OUTPUT_DIR,
     STATUS_FILE,
     RemoteStatus,
+    shorten_remote_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,6 +40,12 @@ EXIT_USAGE = 2
 WORDS_CHECKPOINT = "words.json"
 STATUS_MIN_INTERVAL_S = 1.0
 REDACTED = "***"
+# While running, status.json is rewritten at least this often, even during one long step that
+# reports no progress (a 30-minute diarization chunk, forced alignment). The app treats a status
+# that has not changed for many heartbeats as a dead runner. Read at call time so tests can
+# shorten it.
+HEARTBEAT_S = 60.0
+HEARTBEAT_THREAD_NAME = "status-heartbeat"
 
 PERCENT_PREPARING = 5
 PERCENT_TRANSCRIBE_START = 10
@@ -102,13 +110,26 @@ def redact(text: str, token: str) -> str:
 
 
 class _StatusReporter:
-    """Writes ``status.json``, at most once a second unless the stage changes."""
+    """Writes ``status.json``, at most once a second unless the stage changes.
+
+    ``beat`` rewrites the last running status with a fresh ``updated_at`` (see ``HEARTBEAT_S``).
+    Writes are serialised by a lock because the heartbeat runs on its own thread.
+    """
 
     def __init__(self, path: Path) -> None:
         self._path = path
         self._stage = ""
         self._percent = 0
         self._last_write = float("-inf")
+        self._last: RemoteStatus | None = None
+        self._lock = threading.Lock()
+
+    def beat(self) -> None:
+        with self._lock:
+            last = self._last
+            if last is None or last.state != "running":
+                return
+            self._write_locked(last.state, last.message, last.chunk, last.chunks, None, None)
 
     def update(
         self,
@@ -143,6 +164,18 @@ class _StatusReporter:
         error: str | None,
         now: float,
     ) -> None:
+        with self._lock:
+            self._write_locked(state, message, chunk, chunks, error, now)
+
+    def _write_locked(
+        self,
+        state: str,
+        message: str,
+        chunk: int | None,
+        chunks: int | None,
+        error: str | None,
+        now: float | None,
+    ) -> None:
         status = RemoteStatus(
             state=state,
             stage=self._stage,
@@ -152,9 +185,37 @@ class _StatusReporter:
             chunks=chunks,
             error=error,
             updated_at=time.time(),
+            heartbeat_s=HEARTBEAT_S,
         )
         write_json_atomic(self._path, asdict(status))
-        self._last_write = now
+        self._last = status
+        if now is not None:  # a heartbeat does not count against the progress throttle
+            self._last_write = now
+
+
+class _Heartbeat:
+    """Calls ``reporter.beat()`` every ``HEARTBEAT_S`` seconds until stopped."""
+
+    def __init__(self, reporter: _StatusReporter) -> None:
+        self._reporter = reporter
+        self._interval = HEARTBEAT_S
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name=HEARTBEAT_THREAD_NAME, daemon=True)
+
+    def __enter__(self) -> "_Heartbeat":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        self._thread.join()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self._interval):
+            try:
+                self._reporter.beat()
+            except OSError as exc:
+                logger.warning("Could not refresh status.json: %s", type(exc).__name__)
 
 
 def _find_input(input_dir: Path) -> Path:
@@ -263,18 +324,26 @@ def run_job(
 ) -> None:
     """Run the whole pipeline for ``job_dir``.
 
-    On any exception ``status.json`` is set to ``failed`` (token scrubbed from the error
-    text) and the exception is re-raised so the caller can map it to an exit code.
+    A first status is written before the heavy imports, and a heartbeat keeps it fresh while
+    the job runs. On anything that stops the job, including ``KeyboardInterrupt`` and
+    ``SystemExit``, ``status.json`` is set to ``failed`` (token scrubbed, then shortened) and
+    the exception is re-raised so the caller can map it to an exit code.
     """
-    if steps is None:
-        apply_compat_patches()
-        steps = default_steps()
     job = Path(job_dir)
     reporter = _StatusReporter(job / STATUS_FILE)
     try:
-        _run_pipeline(job, hf_token, device, steps, reporter)
-    except Exception as exc:
-        reporter.fail(redact(f"{type(exc).__name__}: {exc}", hf_token))
+        with _Heartbeat(reporter):
+            reporter.update("preparing", PERCENT_PREPARING, "Starting")
+            if steps is None:
+                apply_compat_patches()
+                steps = default_steps()
+            _run_pipeline(job, hf_token, device, steps, reporter)
+    except BaseException as exc:
+        error = shorten_remote_text(redact(f"{type(exc).__name__}: {exc}", hf_token))
+        try:
+            reporter.fail(error)
+        except OSError as write_error:
+            logger.error("Could not write the failed status: %s", type(write_error).__name__)
         raise
 
 
@@ -295,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         run_job(args.job_dir, hf_token)
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         logger.error("Job failed: %s", redact(f"{type(exc).__name__}: {exc}", hf_token))
         return EXIT_FAILED
     return EXIT_OK
