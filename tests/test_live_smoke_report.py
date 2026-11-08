@@ -258,3 +258,28 @@ def test_endpoint_tracker_summary() -> None:
         tracker.call("create", boom)
     result, note = tracker.summary()
     assert result == "FAIL" and "500" in note
+
+
+def test_command_line_names_only_the_audio_file_not_its_folder() -> None:
+    import argparse
+
+    from scripts.live_smoke import command_line
+
+    args = argparse.Namespace(
+        audio=Path(r"C:\Users\Someone\Downloads\Untitled 1.mp3"),
+        max_spend=2.0,
+        offer_id=None,
+        verify_self_destroy=False,
+    )
+
+    line = command_line(args)
+
+    assert "Untitled 1.mp3" in line
+    assert "Someone" not in line and "Downloads" not in line and "\\" not in line
+
+
+def test_committed_measurement_reports_have_no_personal_paths() -> None:
+    reports = Path(__file__).resolve().parents[1] / "docs" / "measurements"
+    for report in reports.glob("*.md"):
+        text = report.read_text(encoding="utf-8")
+        assert "\\Users\\" not in text and "/Users/" not in text, report.name

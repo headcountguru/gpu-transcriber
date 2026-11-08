@@ -29,7 +29,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import TypeVar
 
 import paramiko
@@ -909,7 +909,9 @@ def cleanup(run: SmokeRun) -> bool:
 
 
 def command_line(args: argparse.Namespace) -> str:
-    parts = ["python", "scripts/live_smoke.py", "--audio", str(args.audio)]
+    # Only the file name: the report is committed, and the folder is a personal path.
+    audio_name = PureWindowsPath(str(args.audio)).name
+    parts = ["python", "scripts/live_smoke.py", "--audio", audio_name]
     parts += ["--max-spend", f"{args.max_spend:g}"]
     if args.offer_id is not None:
         parts += ["--offer-id", str(args.offer_id)]
