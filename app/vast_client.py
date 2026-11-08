@@ -14,7 +14,7 @@ Documentation relied on (fetched 2026-11-06, Vast.ai REST docs):
   - https://docs.vast.ai/api-reference/instances/show-instances  (GET /api/v1/instances, paged)
   - https://docs.vast.ai/api-reference/instances/destroy-instance (DELETE /api/v0/instances/{id}/)
   - https://docs.vast.ai/api-reference/accounts/show-user        (GET /api/v0/users/current/)
-  - https://docs.vast.ai/api-reference/accounts/create-ssh-key   (POST /api/v0/ssh/)
+  - https://docs.vast.ai/api-reference/instances/attach-ssh-key  (POST /api/v0/instances/{id}/ssh)
   - https://docs.vast.ai/cli/reference/search-offers             (units of ``inet_down``)
 
 Unit conversions: the REST API reports ``gpu_ram`` in MB per GPU (docs example: ``gte 24000``
@@ -317,12 +317,16 @@ class VastClient:
                 "Could not read your Vast.ai balance: the answer had no balance in it."
             ) from None
 
-    def register_ssh_key(self, public_key: str) -> None:
-        """Add an SSH public key to the account so new instances accept it."""
+    def attach_ssh_key(self, instance_id: int, public_key: str) -> None:
+        """Let one instance accept an SSH public key.
+
+        Registering a key on the account needs a two-factor login, which an API key cannot have
+        (confirmed live: HTTP 401), so the key is attached to each rented instance instead.
+        """
         self._call(
             "POST",
-            f"{self._base_url}/ssh/",
-            "register the SSH key",
+            f"{self._base_url}/instances/{instance_id}/ssh",
+            f"attach the SSH key to instance {instance_id}",
             json={"ssh_key": public_key},
             require_json=False,
         )

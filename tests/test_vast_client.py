@@ -399,9 +399,11 @@ def test_get_balance_raises_when_no_balance_in_response(client):
 
 
 @responses.activate
-def test_register_ssh_key_posts_the_public_key(client):
-    responses.post(f"{BASE}/ssh/", json={"success": True, "key": {"id": 1}})
-    client.register_ssh_key("ssh-ed25519 AAAAC3 gputx")
+def test_attach_ssh_key_posts_the_public_key_to_that_instance_only(client):
+    # Account-level key registration needs a two-factor login, which an API key cannot have.
+    responses.post(f"{BASE}/instances/42/ssh", json={"success": True, "msg": "attached"})
+    client.attach_ssh_key(42, "ssh-ed25519 AAAAC3 gputx")
+    assert len(responses.calls) == 1
     assert json.loads(responses.calls[0].request.body) == {"ssh_key": "ssh-ed25519 AAAAC3 gputx"}
 
 
@@ -421,9 +423,9 @@ def test_bad_api_key_gives_a_plain_message_without_the_key(client):
 @responses.activate
 @pytest.mark.parametrize("status", [401, 403])
 def test_refused_key_message_names_the_http_code_and_the_permissions_possibility(client, status):
-    responses.post(f"{BASE}/ssh/", status=status, json={"msg": f"no access for {API_KEY}"})
+    responses.post(f"{BASE}/instances/7/ssh", status=status, json={"msg": f"no access {API_KEY}"})
     with pytest.raises(VastError) as err:
-        client.register_ssh_key("ssh-ed25519 AAAA")
+        client.attach_ssh_key(7, "ssh-ed25519 AAAA")
     message = str(err.value)
     assert f"HTTP {status}" in message
     assert "permission" in message
@@ -571,7 +573,7 @@ def test_every_request_passes_a_timeout(client):
     responses.get(f"{V1}/instances", json={"instances": []})
     responses.delete(f"{BASE}/instances/1/", json={"success": True})
     responses.get(f"{BASE}/users/current/", json={"balance": 1})
-    responses.post(f"{BASE}/ssh/", json={"success": True})
+    responses.post(f"{BASE}/instances/1/ssh", json={"success": True})
 
     client.search_offers()
     client.create_instance(7, "img", "gputx-x", 40, "true", {})
@@ -579,7 +581,7 @@ def test_every_request_passes_a_timeout(client):
     client.list_instances("gputx-")
     client.destroy_instance(1)
     client.get_balance()
-    client.register_ssh_key("ssh-ed25519 AAAA")
+    client.attach_ssh_key(1, "ssh-ed25519 AAAA")
 
     assert len(responses.calls) == 7
     for call in responses.calls:

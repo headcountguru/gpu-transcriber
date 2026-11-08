@@ -52,6 +52,8 @@ class FakeClient:
         self.list_results: list[list[Instance]] = [[]]
         self.offers: list[Offer] = [_offer()]
         self.destroy_calls: list[int] = []
+        self.attach_effects: list[Exception | None] = [None]
+        self.attach_calls: list[tuple[int, str]] = []
         self.create_calls = 0
         self.list_calls = 0
 
@@ -79,8 +81,11 @@ class FakeClient:
     def search_offers(self, settings: Settings | None = None) -> list[Offer]:
         return self.offers
 
-    def register_ssh_key(self, key: str) -> None:
-        return None
+    def attach_ssh_key(self, instance_id: int, key: str) -> None:
+        self.attach_calls.append((instance_id, key))
+        effect = self.attach_effects[min(len(self.attach_calls), len(self.attach_effects)) - 1]
+        if effect is not None:
+            raise effect
 
 
 def _run(client: FakeClient, clock: FakeClock) -> SmokeRun:
@@ -224,13 +229,47 @@ def test_spend_guard_stops_the_endpoint_wait() -> None:
     assert clock.now < ls.STARTUP_TIMEOUT_S
 
 
+def test_attach_key_retries_until_the_new_machine_accepts_it() -> None:
+    client, clock = FakeClient(), FakeClock()
+    client.attach_effects = [VastError("not ready", status_code=404), None]
+    run = _run(client, clock)
+
+    ls.attach_key(run, 42, "ssh-ed25519 AAAA")
+
+    assert client.attach_calls == [(42, "ssh-ed25519 AAAA")] * 2
+    assert clock.now == ls.POLL_INTERVAL_S
+
+
+def test_attach_key_gives_up_after_the_attempt_limit() -> None:
+    client, clock = FakeClient(), FakeClock()
+    client.attach_effects = [VastError("refused", status_code=401)]
+    run = _run(client, clock)
+
+    with pytest.raises(VastError):
+        ls.attach_key(run, 42, "ssh-ed25519 AAAA")
+
+    assert len(client.attach_calls) == ls.ATTACH_ATTEMPTS
+
+
+def test_spend_guard_stops_the_attach_retries() -> None:
+    client, clock = FakeClient(), FakeClock()
+    client.attach_effects = [VastError("not ready", status_code=404)]
+    run = _run(client, clock)
+    run.guard = SpendGuard(clock, 0.0, 3600.0, 15.0)  # $1 per second, cap at 15 s
+
+    with pytest.raises(SpendCapReached):
+        ls.attach_key(run, 42, "ssh-ed25519 AAAA")
+
+    assert len(client.attach_calls) < ls.ATTACH_ATTEMPTS
+
+
 def test_spend_guard_stops_an_upload_in_progress(tmp_path: Path) -> None:
     client, clock = FakeClient(), FakeClock()
     run = _run(client, clock)
     run.guard = SpendGuard(clock, 0.0, 3600.0, 50.0)
     audio = tmp_path / "audio.opus"
     audio.write_bytes(b"x")
-    prepared = Prepared(audio, 100.0, _offer(), tmp_path / "key")
+    prepared = Prepared(audio, 100.0, _offer(), tmp_path / "key", "ssh-ed25519 AAAA")
 
     class SlowSession:
         def upload(self, local: Path, remote: str, on_progress: Callable[[int, int], None]) -> None:
@@ -300,7 +339,7 @@ def test_pinned_offer_that_is_too_expensive_is_refused_without_renting(
 
 
 def _fake_prepared(tmp_path: Path) -> Prepared:
-    return Prepared(tmp_path / "a.opus", 100.0, _offer(), tmp_path / "key")
+    return Prepared(tmp_path / "a.opus", 100.0, _offer(), tmp_path / "key", "ssh-ed25519 AAAA")
 
 
 def test_run_exits_3_when_the_machine_cannot_be_confirmed_gone(

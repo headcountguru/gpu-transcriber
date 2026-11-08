@@ -86,6 +86,7 @@ SECONDS_PER_HOUR = 3600.0
 STARTUP_TIMEOUT_S = 1200.0
 SSH_TIMEOUT_S = 300.0
 POLL_INTERVAL_S = 10.0
+ATTACH_ATTEMPTS = 6  # a new instance may refuse the SSH key for the first minute
 MAX_LINK_ERRORS = 18  # consecutive failed status reads (3 minutes) before giving up
 DESTROY_ATTEMPTS = 3
 DESTROY_RETRY_S = 5.0
@@ -383,6 +384,7 @@ class Prepared:
     audio_seconds: float
     offer: Offer
     key_path: Path
+    public_key: str
 
 
 class SmokeRefusal(RuntimeError):
@@ -510,12 +512,11 @@ def prepare(run: SmokeRun, args: argparse.Namespace, workdir: Path) -> Prepared:
     run.timings["compress"] = run.clock() - started
     key_path, public_key = ensure_ssh_key(app_data_dir())
     offer = choose_offer(run, args.offer_id, args.max_spend)
-    run.tracker.call("register_ssh_key", lambda: run.client.register_ssh_key(public_key))
     run.notes.append(
         f"Chosen offer {offer.id}: {offer.gpu_name}, {offer.gpu_ram_gb:.0f} GB, "
         f"datacenter flag {offer.datacenter}, reliability {offer.reliability:.3f}"
     )
-    return Prepared(opus_path, audio_seconds, offer, key_path)
+    return Prepared(opus_path, audio_seconds, offer, key_path, public_key)
 
 
 def onstart_script(job_dir: str) -> str:
@@ -550,6 +551,22 @@ def rent_machine(run: SmokeRun, offer: Offer, max_spend: float) -> int:
     if instance_id not in {item.id for item in listed}:
         run.tracker.fail("list", "the new instance was not in the label listing")
     return instance_id
+
+
+def attach_key(run: SmokeRun, instance_id: int, public_key: str) -> None:
+    """Attach the SSH key to the new instance, retrying while it is still being set up."""
+    for attempt in range(1, ATTACH_ATTEMPTS + 1):
+        run.check_spend()
+        try:
+            run.tracker.call(
+                "attach_ssh_key", lambda: run.client.attach_ssh_key(instance_id, public_key)
+            )
+            return
+        except VastError as exc:
+            if attempt == ATTACH_ATTEMPTS:
+                raise
+            logger.warning("Could not attach the SSH key yet (%d): %s", attempt, exc)
+            run.sleep(POLL_INTERVAL_S)
 
 
 def wait_for_endpoint(run: SmokeRun, instance_id: int) -> Instance:
@@ -747,6 +764,7 @@ def execute(
 ) -> str:
     """Rent, wait, run the job. Cleanup is the caller's ``finally``."""
     instance_id = rent_machine(run, prepared.offer, args.max_spend)
+    attach_key(run, instance_id, prepared.public_key)
     instance = wait_for_endpoint(run, instance_id)
     session = connect_ssh(run, instance, prepared.key_path)
     run.timings["startup"] = run.clock() - (run.created_at or run.clock())
