@@ -4,8 +4,13 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-# Placeholder container image. Task 6 replaces this with the digest-pinned image reference.
-IMAGE = "gpu-transcriber:unpublished"
+# Container image the rented machine runs, pinned by digest (built by
+# .github/workflows/build-image.yml from tag image-0.2, commit 97ad5a5).
+# Update it with every new image build.
+IMAGE = (
+    "ghcr.io/headcountguru/gpu-transcriber"
+    "@sha256:e6b16848b4ce933f44ca106fd4da0182c3440d0c9d936e1bdc660f0483d89ed0"
+)
 
 APP_DATA_DIR_NAME = "GpuTranscriber"
 

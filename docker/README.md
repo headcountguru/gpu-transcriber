@@ -42,8 +42,8 @@ Public. (Optionally link the package to the repo on the same page.)
 ## Use the digest in the app
 
 Set `IMAGE` in `app/settings.py` to the digest reference from the job summary, for example
-`IMAGE = "ghcr.io/<owner>/gpu-transcriber@sha256:<digest>"`. It is currently the placeholder
-`gpu-transcriber:unpublished`.
+`IMAGE = "ghcr.io/<owner>/gpu-transcriber@sha256:<digest>"`. It currently holds the digest of the
+`image-0.2` build.
 
 ## Run the contract test by hand
 
